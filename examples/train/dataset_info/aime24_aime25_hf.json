@@ -1,0 +1,14 @@
+[
+    {
+        "dataset_name": "aime24",
+        "hf_dataset_id": "math-ai/aime24",
+        "split": ["test"],
+        "tags": ["math", "aime"]
+    },
+    {
+        "dataset_name": "aime25",
+        "hf_dataset_id": "math-ai/aime25",
+        "split": ["test"],
+        "tags": ["math", "aime"]
+    }
+]

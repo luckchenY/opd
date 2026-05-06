@@ -8,6 +8,8 @@ if TYPE_CHECKING:
     from .arguments import CPOConfig, DPOConfig, GKDConfig, GRPOConfig, KTOConfig, ORPOConfig, PPOConfig, RewardConfig
     from .cpo_trainer import CPOTrainer
     from .dpo_trainer import DPOTrainer
+    from .gkd_confidence_trainer import GKDConfidenceConfig, GKDConfidenceTrainer
+    from .gkd_softor_trainer import GKDSoftORConfig, GKDSoftORTrainer
     from .gkd_trainer import GKDTrainer
     from .grpo_trainer import GRPOTrainer
     from .kto_trainer import KTOTrainer
@@ -26,13 +28,15 @@ else:
         'orpo_trainer': ['ORPOTrainer'],
         'ppo_trainer': ['PPOTrainer'],
         'reward_trainer': ['RewardTrainer'],
+        'gkd_confidence_trainer': ['GKDConfidenceTrainer', 'GKDConfidenceConfig'],
+        'gkd_softor_trainer': ['GKDSoftORTrainer', 'GKDSoftORConfig'],
         'gkd_trainer': ['GKDTrainer'],
         'rlhf_mixin': ['RLHFTrainerMixin'],
         'args_mixin': ['VllmArguments', 'GRPOArgumentsMixin'],
         'utils': ['patch_lora_merge', 'patch_lora_unmerge', 'round_robin', '_ForwardRedirection'],
         'vllm_client': ['VLLMClient'],
         'arguments':
-        ['DPOConfig', 'CPOConfig', 'KTOConfig', 'ORPOConfig', 'PPOConfig', 'RewardConfig', 'GRPOConfig', 'GKDConfig']
+        ['DPOConfig', 'CPOConfig', 'KTOConfig', 'ORPOConfig', 'PPOConfig', 'RewardConfig', 'GRPOConfig', 'GKDConfig'],
     }
 
     import sys

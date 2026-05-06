@@ -1614,7 +1614,6 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 try:
                     remove_response(data['messages'])
                     template.encode(data)
-                    # Encoding succeeded, add to valid samples
                     valid_samples.append(data)
                 except Exception as e:
                     # Encoding failed, skip this sample
