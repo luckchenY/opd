@@ -6,7 +6,7 @@ set -uo pipefail
 # 数据:    data/eval_datasets/amc/{amc22,amc23,amc24}.jsonl
 # adapter: evalscope 的 amc (split_as_subset=True，subset_list=['amc22','amc23','amc24'])
 # ========================================
-MODEL_PATH=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/output_gkd/v9-20260406-004524/checkpoint-1407
+MODEL_PATH=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/output_gkd_on_policy/v0-20260510-012050/v0-20260510-012109/checkpoint-2350
 GPU_ID=1
 # ========================================
 

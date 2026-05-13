@@ -8,7 +8,11 @@
 #         = 1 - (1 - h_hat_t) * (1 - delta_hat_t)
 # where, for each on-policy token t in the batch,
 #     h_t      = H(P_S(. | c_t)) / log|V|        (normalized student entropy)
-#     delta_t  = D_KL(P_S(. | c_t) || P_T(. | c_t))   (forward KL, student->teacher)
+#     delta_t  = D_KL(P_S(. | c_t) || P_T(. | c_t))
+#                  (== "reverse KL" by GKD paper convention, β=1 in parent GKDTrainer;
+#                   the TIP/Soft-OR paper itself calls it "forward KL" — same math,
+#                   different naming. The expectation is taken under the *student*,
+#                   so it is the mode-seeking direction.)
 # and h_hat / delta_hat are per-batch min-max normalizations of h / delta into [0, 1].
 #
 # Token selection (Eq. 6):
@@ -17,9 +21,13 @@
 # Loss (Eq. 7):
 #     L_TIP = (1 / |T|) * sum_{t in T} D_KL(P_S || P_T)
 #
-# This trainer ALWAYS uses forward KL (paper Eq. 7). The parent's `beta` argument
-# is accepted for signature compatibility but ignored — set --beta 1 in your launch
-# script to make the GKD config self-consistent.
+# IMPORTANT — `beta` is hard-coded:
+#     This trainer ALWAYS computes  D_KL(P_S || P_T)  (== GKDTrainer's β=1, reverse KL).
+#     The parent's `beta` argument is accepted for signature compatibility but is
+#     IGNORED inside `generalized_jsd_loss` below. Whatever value you pass on the CLI
+#     (e.g. --beta 1, --beta 0.5, --beta 0) has NO effect on the loss. Set
+#     `--beta 1` in your launch script purely so the recorded GKD config is
+#     self-consistent with what is actually being computed.
 
 import math
 from collections import defaultdict
@@ -74,15 +82,20 @@ class GKDSoftORTrainer(GKDTrainer):
     alignment, top-k teacher logits, ...) and only overrides `generalized_jsd_loss`
     so that, after the standard label/topk/temperature preprocessing:
 
-      1. We compute per-token forward KL  delta_t = KL(P_S || P_T)  (with grad).
+      1. We compute per-token reverse KL  delta_t = KL(P_S || P_T)  (with grad).
+         (Reverse KL in the GKD-paper sense — the TIP paper calls the same thing
+         "forward KL". Mathematically identical: the expectation is taken under
+         the *student*, so this is the mode-seeking direction.)
       2. We compute per-token normalized student entropy  h_t = H(P_S) / log|V|.
       3. We min-max normalize h and delta over the valid tokens in the batch,
          then take the Soft-OR score   s = h_hat + d_hat - h_hat * d_hat.
       4. We pick the top  k = floor(rho * num_valid)  tokens by score.
       5. The reported loss is the mean of  delta_t  over selected tokens.
 
-    Note: the paper specifies forward KL in Eq. 7, so this trainer ignores the
-    parent's `beta`/JSD/`reverse-KL` controls. Pass `--beta 1` for clarity.
+    Note: this trainer **hard-codes the KL direction to reverse KL** (KL(P_S || P_T),
+    equivalent to GKDTrainer with β=1). The `beta` argument on the CLI / config is
+    IGNORED here — pass `--beta 1` only to keep the recorded GKD config consistent
+    with what is actually being computed.
     """
 
     def __init__(self, *args, **kwargs):
@@ -119,13 +132,18 @@ class GKDSoftORTrainer(GKDTrainer):
         student_logits,
         teacher_logits=None,
         labels=None,
-        beta=0.5,
+        beta=0.5,                # NOTE: ignored — see class / module docstring.
         temperature=1.0,
         chunk_size=512,
         topk=None,
         teacher_topk_logprobs=None,
         teacher_topk_indices=None,
     ):
+        # The `beta` kwarg is accepted only to match the parent signature; the
+        # KL direction is hard-coded below to reverse KL (KL(P_S || P_T), == GKD
+        # β=1). Whatever value the caller passes here has no effect on the loss.
+        del beta  # silence linters and make the intent unmistakable
+
         # ---------- vocab alignment (same as parent) ----------
         if teacher_logits is not None:
             student_logits, teacher_logits = self._align_vocab_size(student_logits, teacher_logits)
@@ -181,7 +199,9 @@ class GKDSoftORTrainer(GKDTrainer):
         effective_vocab = student_logits.size(-1)
         log_vocab = math.log(max(effective_vocab, 2))  # guard against |V| == 1
 
-        # ---------- chunked pass: per-token forward KL (with grad) and entropy ----------
+        # ---------- chunked pass: per-token reverse KL (with grad) and entropy ----------
+        # KL(P_S || P_T): expectation under the student → mode-seeking direction.
+        # (TIP paper calls this "forward KL"; GKD paper calls it "reverse KL", β=1.)
         per_token_kl_chunks = []   # tensors with grad, each shape [chunk]
         per_token_h_chunks = []    # tensors WITHOUT grad, each shape [chunk]
 
@@ -194,21 +214,44 @@ class GKDSoftORTrainer(GKDTrainer):
             t_log_probs = F.log_softmax(t_chunk, dim=-1)
             del s_chunk, t_chunk
 
-            # Forward KL per token: KL(P_S || P_T) = sum_v P_S * (log P_S - log P_T)
+            # Reverse KL per token (GKD β=1): KL(P_S || P_T)
+            #   = sum_v P_S * (log P_S - log P_T)
             # F.kl_div(input, target, log_target=True) with input=t_log_probs,
             # target=s_log_probs computes sum_v exp(s) * (s - t) = KL(s || t).
+            # (TIP paper notation calls this "forward KL" — same math.)
             kl_per_token = F.kl_div(
                 t_log_probs, s_log_probs, reduction='none', log_target=True
             ).sum(dim=-1)  # [chunk], with grad
             per_token_kl_chunks.append(kl_per_token)
 
-            # Normalized student entropy (no grad — only used for token scoring).
+            # Free the teacher log-probs *before* the entropy computation. They
+            # are not needed for entropy and dropping them now makes ~`chunk *
+            # vocab * dtype_size` bytes available for the `slp.exp()` temp.
+            del t_log_probs
+
+            # Normalized student entropy (no grad — only used for ranking, so
+            # fp32 precision is overkill). Two memory-saving tweaks vs. the
+            # naive `-(slp.exp() * slp).sum()`:
+            #   1. Cast the detached log-probs down to the model's compute
+            #      dtype (typically bf16). Under autocast, `F.log_softmax`
+            #      returns fp32 for numerical stability, which would make
+            #      `slp.exp()` a `[chunk, vocab]` *fp32* tensor — twice the
+            #      memory of the underlying logits.
+            #   2. Use in-place `mul_` so `exp(slp)` and `exp(slp) * slp` do
+            #      not co-exist as two separate `[chunk, vocab]` tensors.
+            # Together these cut the entropy peak transient memory ~4×, which
+            # is what was triggering the OOM at line 230 on long completions.
             with torch.no_grad():
                 slp = s_log_probs.detach()
-                h_per_token = -(slp.exp() * slp).sum(dim=-1) / log_vocab  # [chunk]
+                if slp.dtype == torch.float32 and student_logits.dtype != torch.float32:
+                    slp = slp.to(student_logits.dtype)
+                probs = slp.exp()           # [chunk, vocab]
+                probs.mul_(slp)             # in-place: probs = exp(slp) * slp
+                h_per_token = probs.sum(dim=-1).neg_().div_(log_vocab)  # [chunk]
+                del probs, slp
             per_token_h_chunks.append(h_per_token)
 
-            del s_log_probs, t_log_probs
+            del s_log_probs
 
         per_token_kl = torch.cat(per_token_kl_chunks, dim=0)  # [num_valid] with grad
         per_token_h = torch.cat(per_token_h_chunks, dim=0)    # [num_valid] no grad
@@ -262,7 +305,7 @@ class GKDSoftORTrainer(GKDTrainer):
                 self._push_softor_metric('softor/h_mean_dropped', per_token_h[drp_bool].mean().item())
                 self._push_softor_metric('softor/delta_mean_dropped', delta[drp_bool].mean().item())
 
-        # ---------- Eq. 7: forward KL averaged over selected tokens ----------
+        # ---------- Eq. 7: reverse KL averaged over selected tokens ----------
         denom = selection_mask.sum().clamp_min(1.0)
         loss = (per_token_kl * selection_mask).sum() / denom
         return loss

@@ -6,23 +6,46 @@ set -uo pipefail
 # 数据:    data/eval_datasets/math_500/test.jsonl
 # adapter: evalscope 的 math_500 (subset=Level 1..5, reformat_subset)
 # ========================================
-MODEL_PATH=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/output_gkd_softor/v0-20260501-142325/v0-20260501-142406/checkpoint-469
+MODEL_PATH=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/output_gkd_confidence/v4-20260510-234133/checkpoint-3525
 
-GPU_ID=1
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
+# GPU 选择：
+#   1) 如果调用方设置了 CUDA_VISIBLE_DEVICES，就用它指定的卡（脚本不会改写它）
+#   2) 否则用本机 nvidia-smi 看到的全部卡
+# 多卡时采用 vLLM 数据并行（DP）：每卡一份完整模型副本，请求做负载均衡
+# 单机评测里这是最快的并行方式（无 TP 通信开销，吞吐随卡数近线性增长）。
 # ========================================
-
 PASS_K=8
 TEMPERATURE=1
 TOP_P=0.8
-MAX_NEW_TOKENS_SWEEP=(4096 8192 16384 32768)
+MAX_NEW_TOKENS_SWEEP=(2048 4096 8192)
 
 DATA_DIR=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/data/eval_datasets/math_500
+
+# ------------------------------------------------------------------
+# 自动检测 GPU 列表
+# ------------------------------------------------------------------
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    GPU_LIST="${CUDA_VISIBLE_DEVICES}"
+else
+    GPU_LIST=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
+fi
+if [ -z "${GPU_LIST}" ]; then
+    echo "[error] 没有发现可用的 GPU"; exit 1
+fi
+GPU_IDS_ARRAY=( $(echo "${GPU_LIST}" | tr ',' ' ') )
+NUM_GPUS=${#GPU_IDS_ARRAY[@]}
+GPU_LIST=$(IFS=,; echo "${GPU_IDS_ARRAY[*]}")
+
+VLLM_DP_SIZE=${NUM_GPUS}
+VLLM_TP_SIZE=1
+EVAL_NUM_PROC=$((16 * NUM_GPUS))
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 EVAL_ROOT_DIR="${MODEL_PATH}/eval_results/math500_${TIMESTAMP}"
 STATS_TSV="${EVAL_ROOT_DIR}/stats.tsv"
 
-EVAL_MATH500_RUN_ID="eval_math500_$$_$(date +%s)_${GPU_ID}"
+EVAL_MATH500_RUN_ID="eval_math500_$$_$(date +%s)_$(echo "${GPU_LIST}" | tr ',' '-')"
 export EVAL_MATH500_RUN_ID
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
@@ -30,19 +53,22 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 mkdir -p "${EVAL_ROOT_DIR}"
 {
   echo -e "# model_path\t${MODEL_PATH}"
-  echo -e "# gpu\t${GPU_ID}"
+  echo -e "# gpus\t${GPU_LIST}\tnum_gpus\t${NUM_GPUS}"
+  echo -e "# vllm_parallel\tDP=${VLLM_DP_SIZE}\tTP=${VLLM_TP_SIZE}"
   echo -e "# repeats\t${PASS_K}\ttemperature\t${TEMPERATURE}\ttop_p\t${TOP_P}"
   echo -e "# bench\tmath_500"
   echo -e "# strategy\tsweep_max_new_tokens"
   echo -e "model_path\tmax_new_tokens\tdataset\tmetric\tvalue"
 } > "${STATS_TSV}"
 
-PORT=$((8000 + GPU_ID))
+PORT=$((8000 + GPU_IDS_ARRAY[0]))
 
 echo "=========================================="
 echo "Model:      ${MODEL_PATH}"
 echo "Dataset:    MATH-500  (${DATA_DIR})"
-echo "GPU:        ${GPU_ID}        Port: ${PORT}"
+echo "GPUs:       ${GPU_LIST}        (DP=${VLLM_DP_SIZE}, TP=${VLLM_TP_SIZE})"
+echo "Port:       ${PORT}"
+echo "Eval proc:  ${EVAL_NUM_PROC}"
 echo "Sweep:      ${MAX_NEW_TOKENS_SWEEP[*]}"
 echo "Stats:      ${STATS_TSV}"
 echo "Run ID:     ${EVAL_MATH500_RUN_ID}"
@@ -75,7 +101,7 @@ _kill_run_residuals() {
     local pids
     pids=$(_list_run_pids)
     [ -z "${pids}" ] && return 0
-    echo "[info]  killing run residuals on GPU ${GPU_ID}: ${pids//$'\n'/ }"
+    echo "[info]  killing run residuals on GPUs ${GPU_LIST}: ${pids//$'\n'/ }"
     # shellcheck disable=SC2086
     kill -TERM ${pids} 2>/dev/null || true
     local i
@@ -95,15 +121,22 @@ _kill_run_residuals() {
 
 _wait_gpu_clean() {
     local wait_sec="${1:-60}"
-    local i mem
+    local i gid mem busy
     for i in $(seq 1 "${wait_sec}"); do
-        mem=$(nvidia-smi --id="${GPU_ID}" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
-        if [ "${mem:-0}" -lt 500 ] && ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}$"; then
+        busy=0
+        for gid in "${GPU_IDS_ARRAY[@]}"; do
+            mem=$(nvidia-smi --id="${gid}" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
+            if [ "${mem:-0}" -ge 500 ]; then
+                busy=1
+                break
+            fi
+        done
+        if [ "${busy}" = "0" ] && ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}$"; then
             return 0
         fi
         sleep 1
     done
-    echo "[warn]  GPU ${GPU_ID} still busy after ${wait_sec}s (mem=${mem}MiB); proceeding anyway"
+    echo "[warn]  GPUs ${GPU_LIST} still busy after ${wait_sec}s; proceeding anyway"
 }
 
 # ------------------------------------------------------------------
@@ -123,10 +156,12 @@ run_one_eval() {
     _kill_run_residuals
     _wait_gpu_clean 60
 
-    CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+    CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
     PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
     setsid swift eval \
         --model "${MODEL_PATH}" \
+        --model_type qwen2 \
+        --template qwen2_5 \
         --port "${PORT}" \
         --eval_backend Native \
         --eval_dataset math_500 \
@@ -136,6 +171,9 @@ run_one_eval() {
         --extra_eval_args "{\"repeats\": ${PASS_K}}" \
         --infer_backend vllm \
         --vllm_gpu_memory_utilization 0.9 \
+        --vllm_tensor_parallel_size "${VLLM_TP_SIZE}" \
+        --vllm_data_parallel_size "${VLLM_DP_SIZE}" \
+        --eval_num_proc "${EVAL_NUM_PROC}" \
         --max_new_tokens "${max_new_tokens}" \
         --temperature "${TEMPERATURE}" \
         --top_p "${TOP_P}" \
@@ -234,8 +272,12 @@ for jsonl_path in jsonl_files:
                 continue
             try:
                 record = json.loads(line)
-                # 获取 group_id (来自同一个问题的不同重复)
-                group_id = record.get('group_id', 0)
+                # 用题面（input）作为同一题不同采样的 group key。
+                # 注：当前 evalscope 输出里没有 group_id 字段，每行 index 也都不同，
+                # 只有 input 在 PASS_K 次重复中是相同的，可以正确把同题样本聚到一起。
+                inp = record.get('input')
+                group_key = json.dumps(inp, sort_keys=True, ensure_ascii=False) \
+                    if not isinstance(inp, str) else inp
                 sample_score = record.get('sample_score', {})
                 score = sample_score.get('score', {})
                 value = score.get('value', {})
@@ -244,9 +286,23 @@ for jsonl_path in jsonl_files:
                 dataset_results[base_name]['total'] += 1
                 if acc > 0:
                     dataset_results[base_name]['correct'] += 1
-                dataset_results[base_name]['group_scores'][group_id].append(acc)
+                dataset_results[base_name]['group_scores'][group_key].append(acc)
             except (json.JSONDecodeError, KeyError) as e:
                 continue
+
+pass_k = int(pass_k)
+
+# 跨 Level 汇总：
+#   - overall: 把 5 个 Level 所有 sample / group 直接合在一起算（=按题数加权），等价于
+#              标准 MATH-500 / pass@k；MATH-500 的 Level 分布不均衡，这是论文里报的口径。
+#   - macro:   先在每个 Level 内算一次 mean_acc / pass@k，再对 5 个 Level 取算术平均，
+#              反映"跨难度的平均水平"。
+overall_sample_correct = 0
+overall_sample_total = 0
+overall_group_correct = 0
+overall_group_total = 0
+per_level_mean_acc = []
+per_level_pass_k = []
 
 with open(stats_tsv, 'a', encoding='utf-8') as out:
     for ds_name, results in sorted(dataset_results.items()):
@@ -254,12 +310,10 @@ with open(stats_tsv, 'a', encoding='utf-8') as out:
         correct = results['correct']
         mean_acc = correct / total if total > 0 else 0
 
-        # 写入 mean_acc
         out.write(f'{model_path}\t{max_new_tokens}\t{ds_name}\tmean_acc\t{mean_acc:.4f}\n')
-        print(f'  [{max_new_tokens}] {ds_name} mean_acc = {mean_acc:.4f}')
+        print(f'  [{max_new_tokens}] {ds_name} mean_acc = {mean_acc:.4f}  (n={total})')
 
         # 计算 pass@k (只要该 group 有一个正确就算正确)
-        pass_k = int(sys.argv[4])
         group_correct = 0
         group_total = 0
         for group_id, scores in results['group_scores'].items():
@@ -269,7 +323,36 @@ with open(stats_tsv, 'a', encoding='utf-8') as out:
 
         pass_at_k = group_correct / group_total if group_total > 0 else 0
         out.write(f'{model_path}\t{max_new_tokens}\t{ds_name}\tmean_acc_pass@{pass_k}\t{pass_at_k:.4f}\n')
-        print(f'  [{max_new_tokens}] {ds_name} mean_acc_pass@{pass_k} = {pass_at_k:.4f}')
+        print(f'  [{max_new_tokens}] {ds_name} mean_acc_pass@{pass_k} = {pass_at_k:.4f}  (groups={group_total})')
+
+        overall_sample_correct += correct
+        overall_sample_total   += total
+        overall_group_correct  += group_correct
+        overall_group_total    += group_total
+        if total > 0:
+            per_level_mean_acc.append(mean_acc)
+        if group_total > 0:
+            per_level_pass_k.append(pass_at_k)
+
+    # overall（按题数加权 = 论文标准 MATH-500 分）
+    if overall_sample_total > 0:
+        overall_mean_acc = overall_sample_correct / overall_sample_total
+        out.write(f'{model_path}\t{max_new_tokens}\tmath_500_overall\tmean_acc\t{overall_mean_acc:.4f}\n')
+        print(f'  [{max_new_tokens}] math_500_overall mean_acc = {overall_mean_acc:.4f}  (n={overall_sample_total})')
+    if overall_group_total > 0:
+        overall_pass_k = overall_group_correct / overall_group_total
+        out.write(f'{model_path}\t{max_new_tokens}\tmath_500_overall\tmean_acc_pass@{pass_k}\t{overall_pass_k:.4f}\n')
+        print(f'  [{max_new_tokens}] math_500_overall mean_acc_pass@{pass_k} = {overall_pass_k:.4f}  (groups={overall_group_total})')
+
+    # macro（跨 Level 算术平均，不加权）
+    if per_level_mean_acc:
+        macro_mean_acc = sum(per_level_mean_acc) / len(per_level_mean_acc)
+        out.write(f'{model_path}\t{max_new_tokens}\tmath_500_macro\tmean_acc\t{macro_mean_acc:.4f}\n')
+        print(f'  [{max_new_tokens}] math_500_macro   mean_acc = {macro_mean_acc:.4f}  (avg of {len(per_level_mean_acc)} levels)')
+    if per_level_pass_k:
+        macro_pass_k = sum(per_level_pass_k) / len(per_level_pass_k)
+        out.write(f'{model_path}\t{max_new_tokens}\tmath_500_macro\tmean_acc_pass@{pass_k}\t{macro_pass_k:.4f}\n')
+        print(f'  [{max_new_tokens}] math_500_macro   mean_acc_pass@{pass_k} = {macro_pass_k:.4f}  (avg of {len(per_level_pass_k)} levels)')
 PY
 }
 

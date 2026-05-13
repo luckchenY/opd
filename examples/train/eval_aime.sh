@@ -2,10 +2,16 @@
 set -uo pipefail
 
 # ========================================
-# 每次只需要改这两个参数
+# 每次只需要改这一个参数（GPU 自动检测）
 # ========================================
-MODEL_PATH=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/output_gkd_softor/v0-20260501-142325/v0-20260501-142406/checkpoint-469
-GPU_ID=0
+MODEL_PATH=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen3-1.7B
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+# GPU 选择：
+#   1) 如果调用方设置了 CUDA_VISIBLE_DEVICES，就用它指定的卡（脚本不会改写它）
+#   2) 否则用本机 nvidia-smi 看到的全部卡
+# 多卡时采用 vLLM 数据并行（DP）：每卡一份完整模型副本，请求做负载均衡
+# 单机评测里这是最快的并行方式（无 TP 通信开销，吞吐随卡数近线性增长）。
 # ========================================
 
 PASS_K=8
@@ -16,13 +22,36 @@ MAX_NEW_TOKENS_SWEEP=(4096  8192 16384 32768)
 
 DATA_DIR=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/data/aime_datasets
 
+# ------------------------------------------------------------------
+# 自动检测 GPU 列表
+# ------------------------------------------------------------------
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    GPU_LIST="${CUDA_VISIBLE_DEVICES}"
+else
+    GPU_LIST=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
+fi
+if [ -z "${GPU_LIST}" ]; then
+    echo "[error] 没有发现可用的 GPU"; exit 1
+fi
+# 解析为数组，兼容 "0,1,2" / "0 1 2" / 带空格 等情况
+GPU_IDS_ARRAY=( $(echo "${GPU_LIST}" | tr ',' ' ') )
+NUM_GPUS=${#GPU_IDS_ARRAY[@]}
+# 重新规范化 GPU_LIST（去空格）
+GPU_LIST=$(IFS=,; echo "${GPU_IDS_ARRAY[*]}")
+
+# 数据并行 = 卡数；张量并行固定 1（模型够小，DP 吞吐最高）
+VLLM_DP_SIZE=${NUM_GPUS}
+VLLM_TP_SIZE=1
+# 评测客户端并发也按卡数放大，确保所有 DP worker 都被喂饱
+EVAL_NUM_PROC=$((16 * NUM_GPUS))
+
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 EVAL_ROOT_DIR="${MODEL_PATH}/eval_results/${TIMESTAMP}"
 STATS_TSV="${EVAL_ROOT_DIR}/stats.tsv"
 
 # 唯一的 run id：写进子进程环境变量，用于识别"哪些进程是本次 bash 启动的"。
-# 即使同一张 GPU 上同时跑其他人的 swift/vLLM，也不会被误杀。
-EVAL_AIME_RUN_ID="eval_aime_$$_$(date +%s)_${GPU_ID}"
+# 即使同一张卡上同时跑其他人的 swift/vLLM，也不会被误杀。
+EVAL_AIME_RUN_ID="eval_aime_$$_$(date +%s)_$(echo "${GPU_LIST}" | tr ',' '-')"
 export EVAL_AIME_RUN_ID
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
@@ -30,17 +59,21 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 mkdir -p "${EVAL_ROOT_DIR}"
 {
   echo -e "# model_path\t${MODEL_PATH}"
-  echo -e "# gpu\t${GPU_ID}"
+  echo -e "# gpus\t${GPU_LIST}\tnum_gpus\t${NUM_GPUS}"
+  echo -e "# vllm_parallel\tDP=${VLLM_DP_SIZE}\tTP=${VLLM_TP_SIZE}"
   echo -e "# repeats\t${PASS_K}\ttemperature\t${TEMPERATURE}\ttop_p\t${TOP_P}"
   echo -e "# strategy\tsweep_max_new_tokens"
   echo -e "model_path\tmax_new_tokens\tdataset\tmetric\tvalue"
 } > "${STATS_TSV}"
 
-PORT=$((8000 + GPU_ID))
+# 端口随首张卡 id 偏移，避免不同 run 端口冲突
+PORT=$((8000 + GPU_IDS_ARRAY[0]))
 
 echo "=========================================="
 echo "Model:      ${MODEL_PATH}"
-echo "GPU:        ${GPU_ID}        Port: ${PORT}"
+echo "GPUs:       ${GPU_LIST}        (DP=${VLLM_DP_SIZE}, TP=${VLLM_TP_SIZE})"
+echo "Port:       ${PORT}"
+echo "Eval proc:  ${EVAL_NUM_PROC}"
 echo "Sweep:      ${MAX_NEW_TOKENS_SWEEP[*]}"
 echo "Stats:      ${STATS_TSV}"
 echo "Run ID:     ${EVAL_AIME_RUN_ID}"
@@ -66,22 +99,26 @@ trap '_on_signal TERM' TERM
 # ------------------------------------------------------------------
 # 三重判定识别"本次脚本产生的进程"（包括被 PID 1 收养的孤儿 VLLM::EngineCore）：
 #   A) 进程环境变量里有 EVAL_AIME_RUN_ID=${EVAL_AIME_RUN_ID} （正常子进程）
-#   B) pid 当前出现在 ${GPU_ID} 卡上 且 不在 GPU_BASELINE_PIDS 里（本 run 启动前已有的 pid）
+#   B) pid 当前出现在 ${GPU_LIST} 任一卡上 且 不在 GPU_BASELINE_PIDS 里（本 run 启动前已有的 pid）
 #      —— 用来抓环境被清空的孤儿 EngineCore
 # 两者取并集。别人 run 启动的进程不会被杀（不满足 A；若出现在 B，说明是本 run 启动后新增的在本卡上跑的进程，
 # 同卡别人的进程不会被误杀 —— 因为启动前就在 baseline 里了）。
 # ------------------------------------------------------------------
 
-# 快照本卡上"本 run 启动前就存在的 pid 集合"。以后所有"GPU 新增 pid"都视为本 run 产物。
-# 同时用 lsof 快照持有 /dev/nvidia${GPU_ID} fd 的进程——这能抓到孤儿 EngineCore 等
+# 快照本次 run 涉及的所有卡上"启动前就存在的 pid 集合"。以后所有"GPU 新增 pid"都视为本 run 产物。
+# 同时用 lsof 快照持有 /dev/nvidia<id> fd 的进程——这能抓到孤儿 EngineCore 等
 # nvidia-smi --query-compute-apps 报不出来但实际持有 fd 的进程。
 _snapshot_gpu_baseline() {
-    local smi_pids lsof_pids
-    smi_pids=$(nvidia-smi --id="${GPU_ID}" --query-compute-apps=pid \
-        --format=csv,noheader 2>/dev/null | tr -d ' ' | sort -u)
-    lsof_pids=$(lsof "/dev/nvidia${GPU_ID}" 2>/dev/null | awk 'NR>1{print $2}' | sort -u)
-    GPU_BASELINE_PIDS=$(printf '%s\n%s\n' "${smi_pids}" "${lsof_pids}" | sort -u)
-    echo "[info]  GPU ${GPU_ID} baseline pids at start: ${GPU_BASELINE_PIDS//$'\n'/ } (these will NEVER be killed)"
+    local gid smi_pids lsof_pids merged
+    merged=""
+    for gid in "${GPU_IDS_ARRAY[@]}"; do
+        smi_pids=$(nvidia-smi --id="${gid}" --query-compute-apps=pid \
+            --format=csv,noheader 2>/dev/null | tr -d ' ')
+        lsof_pids=$(lsof "/dev/nvidia${gid}" 2>/dev/null | awk 'NR>1{print $2}')
+        merged+=$'\n'"${smi_pids}"$'\n'"${lsof_pids}"
+    done
+    GPU_BASELINE_PIDS=$(printf '%s\n' "${merged}" | tr -s ' ' '\n' | sort -u | sed '/^$/d')
+    echo "[info]  GPUs ${GPU_LIST} baseline pids at start: ${GPU_BASELINE_PIDS//$'\n'/ } (these will NEVER be killed)"
 }
 
 _pid_env_has_run_id() {
@@ -108,17 +145,21 @@ _pid_in_baseline() {
 }
 
 # GPU 上"新增"的、不在 baseline 里的进程 —— 都是本 run 产物（含孤儿 EngineCore）
-# 双通道：
+# 双通道，对 GPU_LIST 中的每一张卡都扫：
 #   1. nvidia-smi --query-compute-apps：抓到正常 CUDA 进程
-#   2. lsof /dev/nvidia${GPU_ID}：抓到 nvidia-smi 认不出来但仍持有 fd 的孤儿进程
+#   2. lsof /dev/nvidia<id>：抓到 nvidia-smi 认不出来但仍持有 fd 的孤儿进程
 #      （vLLM EngineCore 被 PID 1 收养后常常只剩 fd，smi 看不到它但它确实占着显存）
 _list_gpu_new_pids() {
-    local smi_pids lsof_pids all_pids p
-    smi_pids=$(nvidia-smi --id="${GPU_ID}" --query-compute-apps=pid \
-        --format=csv,noheader 2>/dev/null | tr -d ' ')
-    lsof_pids=$(lsof "/dev/nvidia${GPU_ID}" 2>/dev/null | awk 'NR>1{print $2}')
-    all_pids=$(printf '%s\n%s\n' "${smi_pids}" "${lsof_pids}" | tr -s ' ' '\n' | sort -u)
-    for p in ${all_pids}; do
+    local gid smi_pids lsof_pids merged p
+    merged=""
+    for gid in "${GPU_IDS_ARRAY[@]}"; do
+        smi_pids=$(nvidia-smi --id="${gid}" --query-compute-apps=pid \
+            --format=csv,noheader 2>/dev/null | tr -d ' ')
+        lsof_pids=$(lsof "/dev/nvidia${gid}" 2>/dev/null | awk 'NR>1{print $2}')
+        merged+=$'\n'"${smi_pids}"$'\n'"${lsof_pids}"
+    done
+    merged=$(printf '%s\n' "${merged}" | tr -s ' ' '\n' | sort -u | sed '/^$/d')
+    for p in ${merged}; do
         [ -z "${p}" ] && continue
         # 只报告真实存在的进程（过滤 smi 返回的僵尸 PID）
         [ -d "/proc/${p}" ] || continue
@@ -149,7 +190,7 @@ _kill_run_residuals() {
     local pids
     pids=$(_list_run_pids)
     [ -z "${pids}" ] && return 0
-    echo "[info]  killing run residuals on GPU ${GPU_ID}: ${pids//$'\n'/ }"
+    echo "[info]  killing run residuals on GPUs ${GPU_LIST}: ${pids//$'\n'/ }"
     # shellcheck disable=SC2086
     kill -TERM ${pids} 2>/dev/null || true
     local i
@@ -205,7 +246,7 @@ run_one_eval() {
     _wait_stage_clean 180
 
     # EVAL_AIME_RUN_ID 已 export，子进程自动继承；这里再显式传 CUDA_VISIBLE_DEVICES
-    CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+    CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
     PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
     swift eval \
         --model "${MODEL_PATH}" \
@@ -220,6 +261,9 @@ run_one_eval() {
         --extra_eval_args "{\"repeats\": ${PASS_K}}" \
         --infer_backend vllm \
         --vllm_gpu_memory_utilization 0.9 \
+        --vllm_tensor_parallel_size "${VLLM_TP_SIZE}" \
+        --vllm_data_parallel_size "${VLLM_DP_SIZE}" \
+        --eval_num_proc "${EVAL_NUM_PROC}" \
         --max_new_tokens "${max_new_tokens}" \
         --temperature "${TEMPERATURE}" \
         --top_p "${TOP_P}" \

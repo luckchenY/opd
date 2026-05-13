@@ -9,7 +9,7 @@ from swift.utils import get_current_device, get_logger, is_master, is_mp, json_p
 from .sft_args import SftArguments
 
 logger = get_logger()
-rlhf_support_vllm_types = ['grpo', 'gkd']
+rlhf_support_vllm_types = ['grpo', 'gkd', 'gkd_confidence', 'gkd_softor']
 
 
 @dataclass
@@ -222,7 +222,8 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
             Defaults to None.
     """
-    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo', 'grpo', 'gkd'] = 'dpo'
+    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo', 'grpo', 'gkd', 'gkd_confidence',
+                       'gkd_softor'] = 'dpo'
     ref_model: Optional[str] = None
     ref_adapters: List[str] = field(default_factory=list)
     ref_model_type: Optional[str] = field(
@@ -256,6 +257,13 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     seq_kd: bool = False
     gkd_logits_topk: Optional[int] = None
     offload_teacher_model: bool = False
+    # GKD-Confidence: per-microbatch fraction of tokens to keep, ranked
+    # ascending by H_teacher / H_student.  The lowest-ratio fraction is
+    # kept; the rest are dropped from the GKD loss.
+    entropy_ratio_keep_fraction: float = 0.5
+    # GKD-SoftOR (TIP): per-batch top-rho token-importance selection (Eq. 5-7)
+    softor_retention_ratio: float = 0.5
+    softor_norm_eps: float = 1e-8
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 
@@ -402,7 +410,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         self._external_vllm_warning()
 
     def _init_padding_side(self):
-        if self.rlhf_type in {'ppo', 'gkd'}:
+        if self.rlhf_type in {'ppo', 'gkd', 'gkd_confidence', 'gkd_softor'}:
             self.padding_side = 'left'
             # TODO: streaming, MLLM
 
@@ -450,8 +458,12 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
     def _set_default(self):
         if self.beta is None:
-            if self.rlhf_type == 'gkd':
+            if self.rlhf_type in ('gkd', 'gkd_confidence'):
                 self.beta = 0.5
+            elif self.rlhf_type == 'gkd_softor':
+                # TIP / Soft-OR (Eq. 7) is forward KL by definition; the trainer
+                # ignores beta but we set it to 1 so the GKD config is consistent.
+                self.beta = 1.0
             else:
                 self.beta = 0.1
         if self.loss_type is None:
@@ -554,7 +566,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         logger.info(f'Using teacher_deepspeed config: {self.teacher_deepspeed}')
 
     def _check_gkd(self):
-        if self.rlhf_type != 'gkd':
+        if self.rlhf_type not in ('gkd', 'gkd_confidence', 'gkd_softor'):
             return
         if is_mp() and self.use_vllm:
             raise ValueError('GKD with vLLM is not compatible with `device_map`. '

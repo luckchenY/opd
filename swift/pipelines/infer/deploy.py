@@ -274,4 +274,9 @@ def run_deploy(args: DeployArguments, return_url: bool = False):
         yield f'http://127.0.0.1:{deploy_args.port}/v1' if return_url else deploy_args.port
     finally:
         process.terminate()
+        process.join(timeout=15)
+        if process.is_alive():
+            logger.warning('Deploy process did not exit after terminate, killing...')
+            process.kill()
+            process.join(timeout=5)
         logger.info('The deployment process has been terminated.')

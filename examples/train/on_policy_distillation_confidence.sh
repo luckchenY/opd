@@ -3,23 +3,25 @@
 #
 # Difference from on_policy_distillation.sh:
 #   --rlhf_type gkd_confidence
-#       Only back-propagates through token positions where the teacher's
-#       per-token entropy is BELOW teacher_entropy_threshold (in nats).
-#       High-entropy positions (teacher is uncertain) are silently skipped.
+#       Per microbatch, ranks all valid tokens by the entropy ratio
+#       r = H_teacher / H_student (ascending) and keeps only the
+#       lowest-ratio entropy_ratio_keep_fraction of them.  Tokens where
+#       the teacher is much more uncertain than the student (the student
+#       is already sharper) are silently dropped, since distilling there
+#       only adds noise.
 #
-# Entropy threshold guidance (natural-log / nats scale):
-#   top-1 prob | approx entropy  | interpretation
-#   -----------|-----------------|----------------------------------
-#     >= 0.97  | ~0.2 nats       | very confident (deterministic)
-#     ~0.90    | ~0.5 nats       | confident
-#     ~0.75    | ~1.0 nats       | fairly confident   <- default
-#     ~0.55    | ~1.5 nats       | mildly uncertain
-#     ~0.35    | ~2.0 nats       | uncertain
+# Keep-fraction guidance:
+#   value | behaviour
+#   ------|--------------------------------------------------------------
+#   0.25  | aggressive — only the most teacher-confident 25% are kept
+#   0.50  | default — keep the lowest-ratio 50% per microbatch
+#   0.75  | relaxed — keep the lowest-ratio 75%
+#   1.00  | no filtering (equivalent to plain GKD)
 #
-# Reference: EOPD paper – https://arxiv.org/abs/2603.07079
+# Background: EOPD paper – https://arxiv.org/abs/2603.07079
 
-MODEL=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen3-1.7B
-TEACHER_MODEL=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen3-8B
+MODEL=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen2.5-1.5B-Instruct
+TEACHER_MODEL=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen2.5-14B-Instruct
 
 # ===== 选择数据集 (二选一, 注释掉不用的) =====
 #
@@ -31,7 +33,7 @@ EXTRA_DATASET_ARGS=""
 # DATASET='hf::BytedTsinghua-SIA/DAPO-Math-17k'
 # EXTRA_DATASET_ARGS="--columns '{\"prompt\":\"messages\"}'"
 
-ENTROPY_THRESHOLD=0.248
+ENTROPY_RATIO_KEEP_FRACTION=0.5
 
 # W&B: export WANDB_API_KEY before running (do NOT hardcode secrets in scripts)
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -50,6 +52,7 @@ swift rlhf \
     --rlhf_type gkd_confidence \
     --report_to wandb \
     --temperature 1 \
+    --gkd_logits_topk 128 \
     --use_hf true \
     --model "${MODEL}" \
     --teacher_model "${TEACHER_MODEL}" \
@@ -59,17 +62,17 @@ swift rlhf \
     --seq_kd false \
     --lmbda 1 \
     --beta 1 \
-    --teacher_entropy_threshold ${ENTROPY_THRESHOLD} \
+    --entropy_ratio_keep_fraction ${ENTROPY_RATIO_KEEP_FRACTION} \
     --torch_dtype bfloat16 \
-    --num_train_epochs 3 \
+    --num_train_epochs 15 \
     --per_device_train_batch_size 2 \
     --learning_rate 1e-6 \
     --gradient_accumulation_steps 2 \
-    --save_steps 1000 \
+    --save_strategy epoch \
     --save_total_limit 2 \
     --logging_steps 1 \
-    --max_length 4096 \
-    --max_completion_length 4096 \
+    --max_length 16384 \
+    --max_completion_length 8192 \
     --output_dir output_gkd_confidence \
     --warmup_ratio 0.05 \
     --save_only_model true \

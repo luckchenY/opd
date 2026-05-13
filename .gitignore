@@ -119,6 +119,8 @@ venv.bak/
 *.tar.gz
 *.swp
 *.log
+wget-log
+=10.1
 *.tar.gz
 source.sh
 tensorboard.sh
@@ -146,6 +148,25 @@ megatron_output/
 /*-hf/
 /*_cached_dataset/
 /sample_output/
+
+# 本地训练产物（目录名与默认 output/ 不同）
+output_gkd/
+output_gkd_confidence/
+output_gkd_on_policy/
+output_grpo/
+
+# tools 下蒸馏/训练生成的大目录（保留 *.py 等源码）
+tools/weighted_distill_output*/
+tools/correction_distill_output*/
+
+# 模型与常见大权重（只传代码不传模型）
+*.safetensors
+*.bin
+*.gguf
+*.msgpack
+*.h5
+*.onnx
+*.ckpt
 
 # Pytorch
 *.pth

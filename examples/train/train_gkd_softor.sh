@@ -5,17 +5,27 @@
 #     s_t = h_hat + delta_hat - h_hat * delta_hat
 # where h_t = H(P_S) / log|V| and delta_t = D_KL(P_S || P_T), each min-max
 # normalized over the batch.
+#
+# KL direction:
+#     学生在前的 KL：D_KL(P_S || P_T) = E_{x~P_S}[log P_S - log P_T]。
+#     在 GKD 论文 (Agarwal et al. 2024) 的命名约定下，这是 reverse KL（β=1，
+#     mode-seeking）；TIP/Soft-OR 论文把同一个东西叫 "forward KL"。数学上等价。
+#
+# Hyper-params used below:
+#     --lmbda 1    : 100% 学生 on-policy 采样（每步都用 student model rollout）
+#     --seq_kd false: 不做 sequence-level KD（lmbda=1 时也走不到这条分支）
+#     --beta 1     : 注意 — gkd_softor trainer 把 KL 方向"写死"为 reverse KL，
+#                    swift CLI 上的 --beta 实际上不影响损失计算；此处写 1 仅是
+#                    为了让"记录下来的 GKD 配置"与实际计算保持一致，**改成其他值
+#                    （如 0、0.5）也不会改变 loss**。要真正切换 KL 方向只能换回
+#                    --rlhf_type gkd（父类 GKDTrainer 才会真的读 beta）。
 
-MODEL=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen3-1.7B
-
-
-TEACHER_MODEL=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen3-8B
-
+MODEL=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/output_gkd_softor/v0-20260508-143250/v0-20260508-143310/checkpoint-2350
+TEACHER_MODEL=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen2.5-14B-Instruct
 # 数据集
 # --- MATH (EleutherAI/hendrycks_math, 7 个子集, ~7500 条) ---
 DATASET='hf::EleutherAI/hendrycks_math:algebra/counting_and_probability/geometry/intermediate_algebra/number_theory/prealgebra/precalculus'
 EXTRA_DATASET_ARGS=""
-
 # --- DAPO-Math-17k (deduped) ---
 # HF 发布版 DAPO 有 ~1.79M raw rows = ~17k 独立题目 × ~103 重复
 # (见 tools/process_reward_weighted_distill.py 的 _extract_problem_text + 注释)
@@ -45,9 +55,9 @@ export HF_HUB_OFFLINE=1
 echo "Output directory: ${OUTPUT_DIR}"
 echo "Soft-OR retention ratio (rho): ${SOFTOR_RETENTION_RATIO}"
 
-NPROC_PER_NODE=4 \
+NPROC_PER_NODE=8 \
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 swift rlhf \
     --rlhf_type gkd_softor \
     --report_to wandb \
@@ -63,15 +73,14 @@ swift rlhf \
     --temperature 1.0 \
     --softor_retention_ratio ${SOFTOR_RETENTION_RATIO} \
     --torch_dtype bfloat16 \
-    --num_train_epochs 1 \
+    --num_train_epochs 10 \
     --per_device_train_batch_size 1 \
     --learning_rate 1e-6 \
     --lr_scheduler_type cosine \
     --gradient_accumulation_steps 4 \
     --num_generations 8 \
-    --save_strategy steps \
-    --save_steps 100 \
-    --save_total_limit 1 \
+    --save_strategy epoch \
+    --save_total_limit 5 \
     --logging_steps 1 \
     --max_length 16384 \
     --max_completion_length 8192 \
@@ -85,4 +94,4 @@ swift rlhf \
     --attn_impl flash_attn \
     --use_vllm true \
     --vllm_mode colocate \
-    --vllm_gpu_memory_utilization 0.5
+    --vllm_gpu_memory_utilization 0.3

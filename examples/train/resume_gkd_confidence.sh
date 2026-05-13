@@ -8,7 +8,7 @@ TEACHER_MODEL=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/mod
 DATASET='hf::EleutherAI/hendrycks_math:algebra/counting_and_probability/geometry/intermediate_algebra/number_theory/prealgebra/precalculus'
 EXTRA_DATASET_ARGS=""
 
-ENTROPY_THRESHOLD=1.0
+ENTROPY_RATIO_KEEP_FRACTION=0.5
 
 # 输出目录和检查点路径
 OUTPUT_DIR=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/output_gkd_confidence/v0-20260331-012058
@@ -41,7 +41,7 @@ swift rlhf \
     --seq_kd false \
     --lmbda 1 \
     --beta 1 \
-    --teacher_entropy_threshold ${ENTROPY_THRESHOLD} \
+    --entropy_ratio_keep_fraction ${ENTROPY_RATIO_KEEP_FRACTION} \
     --torch_dtype bfloat16 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \

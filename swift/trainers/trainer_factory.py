@@ -25,6 +25,8 @@ class TrainerFactory:
         'ppo': 'swift.rlhf_trainers.PPOTrainer',
         'grpo': 'swift.rlhf_trainers.GRPOTrainer',
         'gkd': 'swift.rlhf_trainers.GKDTrainer',
+        'gkd_confidence': 'swift.rlhf_trainers.GKDConfidenceTrainer',
+        'gkd_softor': 'swift.rlhf_trainers.GKDSoftORTrainer',
     }
 
     TRAINING_ARGS_MAPPING = {
@@ -42,6 +44,8 @@ class TrainerFactory:
         'ppo': 'swift.rlhf_trainers.PPOConfig',
         'grpo': 'swift.rlhf_trainers.GRPOConfig',
         'gkd': 'swift.rlhf_trainers.GKDConfig',
+        'gkd_confidence': 'swift.rlhf_trainers.GKDConfidenceConfig',
+        'gkd_softor': 'swift.rlhf_trainers.GKDSoftORConfig',
     }
 
     @staticmethod
