@@ -25,34 +25,28 @@ import re
 from html import escape as html_escape
 
 import numpy as np
-import pyarrow.ipc as ipc
 import torch
 import torch.nn.functional as F
+from collections import defaultdict
+
+from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 
 # ── config ──────────────────────────────────────────────────────────────────
-STUDENT_MODEL = "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen3-1.7B"
-TEACHER_MODEL = "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen3-8B"
+STUDENT_MODEL = os.environ.get("STUDENT_MODEL", "Qwen/Qwen3-1.7B")
+TEACHER_MODEL = os.environ.get("TEACHER_MODEL", "Qwen/Qwen3-8B")
 
-DATASET = "hendrycks_math"
-
-_CACHE_ROOT = (
-    "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift"
-    "/data/hf_datasets_cache"
-)
+DATASET   = "hendrycks_math"
+_DATA_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 DATASET_CONFIGS = {
     "hendrycks_math": {
-        "arrow_shards": [
-            f"{_CACHE_ROOT}/EleutherAI___hendrycks_math/{subset}/0.0.0"
-            "/21a5633873b6a120296cce3e2df9d5550074f4a3/hendrycks_math-train.arrow"
-            for subset in [
-                "algebra", "counting_and_probability", "geometry",
-                "intermediate_algebra", "number_theory", "prealgebra", "precalculus",
-            ]
+        "subsets": [
+            "algebra", "counting_and_probability", "geometry",
+            "intermediate_algebra", "number_theory", "prealgebra", "precalculus",
         ],
-        "prompt_key": "problem",
+        "prompt_key":   "problem",
         "solution_key": "solution",
     },
 }
@@ -79,6 +73,19 @@ SEGMENT_MIN_PERIODS = 3
 TEMPERATURE = 1.0
 TOP_K       = 50
 TOP_P       = 1.0
+
+K_EVAL              = 4
+EVAL_TEMPERATURE    = 0.7
+MAX_ANSWER_TOKENS   = 256
+TEACHER_CONT_TOKENS = 128
+
+EPISODE_EVAL_SYSTEM = "Put your final answer within \\boxed{}."
+EPISODE_EVAL_SUFFIX = (
+    "\nBased on the reasoning above, stop thinking now and summarize the existing"
+    " reasoning. If a definitive answer can be derived, give the final answer in"
+    " \\boxed{answer}. If no answer has been reached yet or the result is still"
+    " inconclusive, output \\boxed{no answer}."
+)
 
 OUTPUT_HTML = os.path.join(os.path.dirname(__file__), "kl_heatmap.html")
 OUTPUT_JSON = os.path.join(os.path.dirname(__file__), "kl_heatmap_data.json")
@@ -141,22 +148,16 @@ def build_prompt(problem_text, tokenizer):
 
 def load_dataset_samples():
     random.seed(SEED)
-    cfg = DATASET_CONFIGS[DATASET]
-    shards = cfg["arrow_shards"]
-    print(f"Loading dataset '{DATASET}' ({len(shards)} shards) …", flush=True)
+    cfg     = DATASET_CONFIGS[DATASET]
+    subsets = cfg["subsets"]
+    print(f"Loading dataset '{DATASET}' ({len(subsets)} subsets) …", flush=True)
     pool = []
-    for shard_path in shards:
-        reader = ipc.open_stream(shard_path)
-        while True:
-            try:
-                batch = reader.read_next_batch()
-            except StopIteration:
-                break
-            for i in range(len(batch)):
-                pool.append({col: batch.column(col)[i].as_py()
-                             for col in batch.schema.names})
-    total = len(pool)
-    idx = random.sample(range(total), min(N_SAMPLES, total))
+    for subset in subsets:
+        path = os.path.join(_DATA_ROOT, DATASET, subset)
+        ds   = load_from_disk(path)
+        pool.extend(ds)
+    total   = len(pool)
+    idx     = random.sample(range(total), min(N_SAMPLES, total))
     samples = [pool[i] for i in idx]
     del pool
     print(f"  Sampled {len(samples)} / {total} rows", flush=True)
@@ -167,7 +168,7 @@ def load_dataset_samples():
 
 def _vllm_generate(model_path, tokenizer, prompt_strings, do_sample=True):
     """Use vLLM for fast parallel generation. Returns list[(full_ids_tensor, prompt_len)]."""
-    tp = min(N_GPUS, 4)  # tensor-parallel degree
+    tp =N_GPUS # tensor-parallel degree
     print(f"  Initializing vLLM (tp={tp}) …", flush=True)
     llm = LLM(
         model=model_path,
@@ -279,6 +280,229 @@ def segment_by_triggers(tokens, trigger_patterns=None, min_periods=None):
 
     _add_segment(segments, tokens, current_start, len(tokens))
     return segments
+
+
+# ── Episode eval + monotonic merge helpers ────────────────────────────────────
+
+def _build_episode_prefix(problem, partial_resp_text, eval_tokenizer):
+    resp = partial_resp_text
+    if "<think>" in resp and "</think>" not in resp:
+        resp = resp.rstrip() + "\n</think>"
+    msgs = [
+        {"role": "system", "content": EPISODE_EVAL_SYSTEM},
+        {"role": "user",   "content": problem},
+    ]
+    base = eval_tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=True
+    )
+    return base + resp + EPISODE_EVAL_SUFFIX
+
+
+def merge_monotonic_runs_indexed(segs):
+    """Like merge_monotonic_runs but also returns kept indices into segs."""
+    n = len(segs)
+    if n <= 1:
+        return list(segs), list(range(n))
+
+    def _sign(a, b):
+        d = b["process_reward"] - a["process_reward"]
+        return 1 if d > 0 else (-1 if d < 0 else 0)
+
+    signs = [_sign(segs[i], segs[i + 1]) for i in range(n - 1)]
+    active_dir = 0
+    kept_indices = []
+
+    for i in range(n - 1):
+        s = signs[i]
+        if s != 0:
+            if active_dir != 0 and s != active_dir:
+                kept_indices.append(i)
+            active_dir = s
+        if i == n - 2:
+            kept_indices.append(n - 1)
+
+    if not kept_indices:
+        kept_indices = [n - 1]
+
+    return [segs[idx] for idx in kept_indices], kept_indices
+
+
+def phase4_episode_eval(case_data):
+    print(f"\n{'='*60}")
+    print(f"Phase 4: K={K_EVAL}-fold episode evaluation  "
+          f"(model: {os.path.basename(TEACHER_MODEL)}, T={EVAL_TEMPERATURE})")
+    print(f"{'='*60}", flush=True)
+
+    eval_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
+
+    eval_items = []
+    for ci, case in enumerate(case_data):
+        for ep_idx, seg in enumerate(case.get("segments", [])):
+            partial_resp = "".join(tok["text"] for tok in case["tokens"][: seg["end"]])
+            eval_items.append(dict(
+                case_idx=ci,
+                ep_idx=ep_idx,
+                ep_num=ep_idx + 1,
+                partial_resp=partial_resp,
+                problem=case["problem"],
+                gt_answer=case["gt_answer"],
+            ))
+
+    total_pairs = len(eval_items)
+    print(f"  (case, episode) pairs: {total_pairs}  "
+          f"(× K={K_EVAL} = {total_pairs * K_EVAL} completions)", flush=True)
+
+    if not eval_items:
+        print("  No eval items found.", flush=True)
+        return []
+
+    prefixes = [
+        _build_episode_prefix(item["problem"], item["partial_resp"], eval_tokenizer)
+        for item in eval_items
+    ]
+
+    tp = min(N_GPUS, 4)
+    llm = LLM(
+        model=TEACHER_MODEL,
+        tensor_parallel_size=tp,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        max_model_len=MAX_NEW_TOKENS + 1024,
+        gpu_memory_utilization=0.85,
+        enable_prefix_caching=True,
+    )
+    params = SamplingParams(
+        n=K_EVAL,
+        max_tokens=MAX_ANSWER_TOKENS,
+        temperature=EVAL_TEMPERATURE,
+        top_k=TOP_K,
+        top_p=TOP_P,
+        stop=["<|im_end|>"],
+    )
+    print("  Running vLLM inference …", flush=True)
+    outputs = llm.generate(prefixes, params)
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    for item, out in zip(eval_items, outputs):
+        gen_texts = [o.text for o in out.outputs]
+        preds     = [extract_boxed_answer(t) for t in gen_texts]
+        corrects  = [answers_match(p, item["gt_answer"]) for p in preds]
+        item["acc_rate"] = round(sum(corrects) / K_EVAL, 4)
+
+    print(f"  Evaluated {len(eval_items)} items.", flush=True)
+    return eval_items
+
+
+def phase5_merge_and_continuations(case_data, eval_items):
+    print(f"\n{'='*60}")
+    print("Phase 5: Monotonic merge + teacher continuations")
+    print(f"{'='*60}", flush=True)
+
+    # ── Attach acc_rate + process_reward to each segment ─────────────────
+    ep_map = defaultdict(dict)
+    for item in eval_items:
+        ep_map[item["case_idx"]][item["ep_num"]] = item
+
+    for ci, case in enumerate(case_data):
+        prev_acc = 0.0
+        for ep_idx, seg in enumerate(case["segments"]):
+            item     = ep_map[ci].get(ep_idx + 1, {})
+            acc      = item.get("acc_rate", 0.0)
+            seg["acc_rate"]       = acc
+            seg["process_reward"] = round(acc - prev_acc, 6)
+            prev_acc = acc
+
+    # ── Monotonic merge per case ──────────────────────────────────────────
+    for ci, case in enumerate(case_data):
+        segs = case["segments"]
+        if not segs:
+            case["merged_segments"] = []
+            continue
+
+        _, kept_indices = merge_monotonic_runs_indexed(segs)
+        run_starts = [0] + [kept_indices[j] + 1 for j in range(len(kept_indices) - 1)]
+
+        merged = []
+        for mi, (kept_idx, run_start) in enumerate(zip(kept_indices, run_starts)):
+            run_segs  = segs[run_start:kept_idx + 1]
+            total_len = sum(s["length"] for s in run_segs) or 1
+            kl_fwd = sum(s["kl_forward_mean"] * s["length"] for s in run_segs) / total_len
+            kl_rev = sum(s["kl_reverse_mean"] * s["length"] for s in run_segs) / total_len
+            ent    = sum(s["teacher_entropy_mean"] * s["length"] for s in run_segs) / total_len
+            merged.append(dict(
+                merged_idx=mi,
+                orig_ep_start=run_start + 1,
+                orig_ep_end=kept_idx + 1,
+                start=segs[run_start]["start"],
+                end=segs[kept_idx]["end"],
+                length=total_len,
+                kl_forward_mean=round(kl_fwd, 6),
+                kl_reverse_mean=round(kl_rev, 6),
+                teacher_entropy_mean=round(ent, 6),
+                process_reward=segs[kept_idx]["process_reward"],
+                acc_rate=segs[kept_idx]["acc_rate"],
+                teacher_continuation="",
+            ))
+
+        case["merged_segments"] = merged
+
+        # Re-annotate token merged_segment indices
+        for mi, mseg in enumerate(merged):
+            for ti in range(mseg["start"], mseg["end"]):
+                if ti < len(case["tokens"]):
+                    case["tokens"][ti]["merged_segment"] = mi
+
+        raw_n = len(segs)
+        mrg_n = len(merged)
+        print(f"  Case {ci}: {raw_n} segs → {mrg_n} merged "
+              f"({(1 - mrg_n / max(raw_n, 1)) * 100:.0f}% reduction)", flush=True)
+
+    # ── Batch-generate teacher continuations ──────────────────────────────
+    cont_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
+    cont_items = []
+    for ci, case in enumerate(case_data):
+        for mseg in case.get("merged_segments", []):
+            partial = "".join(tok["text"] for tok in case["tokens"][:mseg["end"]])
+            msgs = [{"role": "user", "content": case["problem"]}]
+            # add_generation_prompt=False to avoid appending <think> token
+            # then manually add assistant turn prefix so partial starts correctly
+            base = cont_tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=False
+            )
+            base = base + "<|im_start|>assistant\n"
+            cont_items.append(dict(ci=ci, mi=mseg["merged_idx"], prompt=base + partial))
+
+    if cont_items:
+        tp = min(N_GPUS, 4)
+        llm = LLM(
+            model=TEACHER_MODEL,
+            tensor_parallel_size=tp,
+            dtype="bfloat16",
+            trust_remote_code=True,
+            max_model_len=MAX_NEW_TOKENS + 1024,
+            gpu_memory_utilization=0.85,
+            enable_prefix_caching=True,
+        )
+        params = SamplingParams(
+            n=1,
+            max_tokens=TEACHER_CONT_TOKENS,
+            temperature=0.0,
+            stop=["<|im_end|>"],
+        )
+        print(f"  Generating {len(cont_items)} teacher continuations …", flush=True)
+        outputs = llm.generate([item["prompt"] for item in cont_items], params)
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        for item, out in zip(cont_items, outputs):
+            cont_text = out.outputs[0].text if out.outputs else ""
+            case_data[item["ci"]]["merged_segments"][item["mi"]]["teacher_continuation"] = cont_text
+
+    print(f"  Done. {len(cont_items)} continuations generated.", flush=True)
+    return case_data
 
 
 # ── Phase 1: student on-policy sampling ──────────────────────────────────────
@@ -726,6 +950,21 @@ select{
   border-top:1px solid #2a4a6a;
   letter-spacing:.04em;
 }
+/* ── teacher continuation ── */
+.cont-wrap{display:block;margin:4px 0 8px;padding:0 10px}
+.cont-toggle{
+  font-size:.70rem;color:#7a9acc;cursor:pointer;
+  text-decoration:underline dotted;letter-spacing:.02em;user-select:none;
+}
+.cont-toggle:hover{color:#aaccff}
+.cont-text{
+  display:none;margin-top:5px;padding:10px 14px;
+  background:#131325;border-radius:6px;
+  border:1px solid #2a3a5a;
+  font-family:'SF Mono','Fira Code',monospace;
+  font-size:.80rem;color:#c0d0e8;line-height:1.6;
+  white-space:pre-wrap;max-height:280px;overflow-y:auto;
+}
 /* ── episode-level bar ── */
 .episode-label{
   font-size:.78rem;color:#888;margin:16px 0 6px;
@@ -816,6 +1055,27 @@ select{
 
 <script>
 const DATA = __JSON_DATA__;
+const TEACHER_CONT_TOKENS = __TEACHER_CONT_TOKENS__;
+
+function appendContinuation(container, text, mergedEpNum) {
+  const wrap = document.createElement('div');
+  wrap.className = 'cont-wrap';
+  const toggle = document.createElement('span');
+  toggle.className = 'cont-toggle';
+  toggle.textContent = '▸ Teacher continuation — merged ep ' + mergedEpNum + ' (' + TEACHER_CONT_TOKENS + ' tok)';
+  const pre = document.createElement('pre');
+  pre.className = 'cont-text';
+  toggle.onclick = () => {
+    const show = pre.style.display !== 'block';
+    pre.style.display = show ? 'block' : 'none';
+    toggle.textContent = (show ? '▾' : '▸') +
+      ' Teacher continuation — merged ep ' + mergedEpNum + ' (' + TEACHER_CONT_TOKENS + ' tok)';
+  };
+  pre.textContent = text;
+  wrap.appendChild(toggle);
+  wrap.appendChild(pre);
+  container.appendChild(wrap);
+}
 
 const alphaSlider  = document.getElementById('alpha');
 const alphaVal     = document.getElementById('alpha-val');
@@ -968,8 +1228,9 @@ function renderAll() {
     `;
     container.appendChild(card);
 
-    // ── Episode bar ──────────────────────────────────────────────────────
-    if (c.segments && c.segments.length > 0) {
+    // ── Episode bar (merged segments) ────────────────────────────────────
+    const msegs = c.merged_segments || [];
+    if (msegs.length > 0) {
       const epView  = document.getElementById(`ep-${ci}`);
       const epAxis  = document.getElementById(`ep-axis-${ci}`);
       const entView = document.getElementById(`ent-${ci}`);
@@ -977,49 +1238,47 @@ function renderAll() {
       epAxis.innerHTML = '';
       entView.innerHTML = '';
 
-      const totalLen = c.segments.reduce((s, seg) => s + seg.length, 0);
+      const totalLen = msegs.reduce((s, ms) => s + ms.length, 0);
 
-      // KL bar: use per-episode max for colour normalization
-      const segMixed = c.segments.map(seg =>
-        alpha * seg.kl_forward_mean + (1 - alpha) * seg.kl_reverse_mean);
+      const segMixed = msegs.map(ms =>
+        alpha * ms.kl_forward_mean + (1 - alpha) * ms.kl_reverse_mean);
       const segScaled = segMixed.map(v => scaleFn(v, scale));
       const segMax = Math.max(...segScaled, 1e-9);
 
-      // Entropy bar: normalize by max entropy across segments
-      const segEnt = c.segments.map(seg => seg.teacher_entropy_mean || 0);
+      const segEnt = msegs.map(ms => ms.teacher_entropy_mean || 0);
       const segEntScaled = segEnt.map(v => scaleFn(v, scale));
       const segEntMax = Math.max(...segEntScaled, 1e-9);
 
-      c.segments.forEach((seg, si) => {
-        const widthPct = (seg.length / totalLen * 100).toFixed(3);
-        const ratio    = segScaled[si] / segMax;
+      msegs.forEach((ms, mi) => {
+        const widthPct = (ms.length / totalLen * 100).toFixed(3);
+        const ratio    = segScaled[mi] / segMax;
 
         const el = document.createElement('div');
         el.className  = 'ep-seg';
         el.style.width = widthPct + '%';
         el.style.backgroundColor = klColor(ratio);
-        if (seg.length > 25) el.textContent = `#${si + 1}`;
+        if (ms.length > 25) el.textContent = `#${mi + 1}`;
         el.dataset.ci = ci;
-        el.dataset.si = si;
+        el.dataset.mi = mi;
         epView.appendChild(el);
 
-        // axis label
         const lbl = document.createElement('span');
         lbl.style.width = widthPct + '%';
         lbl.style.paddingLeft = '2px';
-        lbl.title = `ep${si+1}: ${seg.length} tok · KL=${segMixed[si].toFixed(3)}`;
-        lbl.textContent = seg.length > 20 ? `${seg.length}t` : '';
+        const epRange = ms.orig_ep_start === ms.orig_ep_end
+          ? `ep${ms.orig_ep_start}` : `ep${ms.orig_ep_start}-${ms.orig_ep_end}`;
+        lbl.title = `${epRange}: ${ms.length} tok · KL=${segMixed[mi].toFixed(3)}`;
+        lbl.textContent = ms.length > 20 ? `${ms.length}t` : '';
         epAxis.appendChild(lbl);
 
-        // ── Entropy bar segment ──
-        const entRatio = segEntScaled[si] / segEntMax;
+        const entRatio = segEntScaled[mi] / segEntMax;
         const entEl = document.createElement('div');
         entEl.className = 'ent-seg';
         entEl.style.width = widthPct + '%';
         entEl.style.backgroundColor = entColor(entRatio);
-        if (seg.length > 25) entEl.textContent = `#${si + 1}`;
+        if (ms.length > 25) entEl.textContent = `#${mi + 1}`;
         entEl.dataset.ci = ci;
-        entEl.dataset.si = si;
+        entEl.dataset.mi = mi;
         entEl.dataset.isEnt = '1';
         entView.appendChild(entEl);
       });
@@ -1028,7 +1287,7 @@ function renderAll() {
     // ── Token heatmap ────────────────────────────────────────────────────
     const hm = document.getElementById(`hm-${ci}`);
     let inThinking = true;
-    let curSegment = -1;
+    let curMergedSeg = -1;
     c.tokens.forEach((tok, ti) => {
       if (tok.region === 'answer' && inThinking) {
         inThinking = false;
@@ -1038,17 +1297,21 @@ function renderAll() {
         hm.appendChild(divider);
       }
 
-      // Segment boundary divider (skip for the very first segment)
-      const tokSeg = tok.segment !== undefined ? tok.segment : 0;
-      if (tokSeg !== curSegment) {
-        if (curSegment >= 0) {
-          const segDiv = document.createElement('span');
-          segDiv.className = 'seg-divider';
-          segDiv.textContent = `── episode ${tokSeg + 1} ──`;
-          hm.appendChild(segDiv);
+      const tokMSeg = tok.merged_segment !== undefined ? tok.merged_segment : 0;
+      if (tokMSeg !== curMergedSeg && curMergedSeg >= 0) {
+        const prevMs = (c.merged_segments || [])[curMergedSeg];
+        const prStr = (prevMs && prevMs.process_reward !== undefined)
+          ? '  PR ' + (prevMs.process_reward >= 0 ? '+' : '') + prevMs.process_reward.toFixed(3)
+          : '';
+        const segDiv = document.createElement('span');
+        segDiv.className = 'seg-divider';
+        segDiv.textContent = '── merged ep ' + (curMergedSeg + 1) + prStr + ' ──';
+        hm.appendChild(segDiv);
+        if (prevMs && prevMs.teacher_continuation) {
+          appendContinuation(hm, prevMs.teacher_continuation, curMergedSeg + 1);
         }
-        curSegment = tokSeg;
       }
+      curMergedSeg = tokMSeg;
 
       const sv = scaleFn(tok._mixed, scale);
       const ratio = sv / maxVal;
@@ -1068,6 +1331,21 @@ function renderAll() {
       span.dataset.ti = ti;
       hm.appendChild(span);
     });
+
+    // Show divider + continuation for the last merged segment
+    if (curMergedSeg >= 0) {
+      const lastMs = (c.merged_segments || [])[curMergedSeg];
+      const prStr = (lastMs && lastMs.process_reward !== undefined)
+        ? '  PR ' + (lastMs.process_reward >= 0 ? '+' : '') + lastMs.process_reward.toFixed(3)
+        : '';
+      const segDiv = document.createElement('span');
+      segDiv.className = 'seg-divider';
+      segDiv.textContent = '── merged ep ' + (curMergedSeg + 1) + prStr + ' (end) ──';
+      hm.appendChild(segDiv);
+      if (lastMs && lastMs.teacher_continuation) {
+        appendContinuation(hm, lastMs.teacher_continuation, curMergedSeg + 1);
+      }
+    }
   });
 }
 
@@ -1082,57 +1360,62 @@ function htmlSafe(s) {
 document.addEventListener('mousemove', e => {
   const el = e.target;
 
-  // ── Episode KL bar tooltip ───────────────────────────────────────────
+  // ── Episode KL bar tooltip (merged segments) ─────────────────────────
   if (el.classList.contains('ep-seg')) {
-    const ci  = parseInt(el.dataset.ci);
-    const si  = parseInt(el.dataset.si);
-    const seg = DATA[ci].segments[si];
-    const alpha  = parseFloat(alphaSlider.value);
-    const mixed  = (alpha * seg.kl_forward_mean + (1 - alpha) * seg.kl_reverse_mean).toFixed(4);
-    const entMean = (seg.teacher_entropy_mean || 0).toFixed(4);
-    const preview = seg.text_preview
-      ? htmlSafe(seg.text_preview.substring(0, 120)) + (seg.text_preview.length > 120 ? '…' : '')
-      : '';
+    const ci = parseInt(el.dataset.ci);
+    const mi = parseInt(el.dataset.mi);
+    const ms = (DATA[ci].merged_segments || [])[mi];
+    if (!ms) { tooltip.style.display = 'none'; return; }
+    const alpha   = parseFloat(alphaSlider.value);
+    const mixed   = (alpha * ms.kl_forward_mean + (1 - alpha) * ms.kl_reverse_mean).toFixed(4);
+    const entMean = (ms.teacher_entropy_mean || 0).toFixed(4);
+    const prStr   = ms.process_reward !== undefined
+      ? (ms.process_reward >= 0 ? '+' : '') + ms.process_reward.toFixed(4) : '—';
+    const epRange = ms.orig_ep_start === ms.orig_ep_end
+      ? `Ep ${ms.orig_ep_start}` : `Ep ${ms.orig_ep_start}–${ms.orig_ep_end}`;
     tooltip.innerHTML = `
-      <div class="tt-token">Episode ${si + 1} — KL</div>
-      <div class="tt-row"><span class="tt-label">Tokens</span><span class="tt-val">${seg.length}</span></div>
-      <div class="tt-row"><span class="tt-label">KL(T‖S) mean</span><span class="tt-val">${seg.kl_forward_mean.toFixed(4)}</span></div>
-      <div class="tt-row"><span class="tt-label">KL(S‖T) mean</span><span class="tt-val">${seg.kl_reverse_mean.toFixed(4)}</span></div>
+      <div class="tt-token">${epRange} (merged) — KL</div>
+      <div class="tt-row"><span class="tt-label">Tokens</span><span class="tt-val">${ms.length}</span></div>
+      <div class="tt-row"><span class="tt-label">KL(T‖S) mean</span><span class="tt-val">${ms.kl_forward_mean.toFixed(4)}</span></div>
+      <div class="tt-row"><span class="tt-label">KL(S‖T) mean</span><span class="tt-val">${ms.kl_reverse_mean.toFixed(4)}</span></div>
       <div class="tt-row"><span class="tt-label">Mixed KL</span><span class="tt-val">${mixed}</span></div>
       <div class="tt-row"><span class="tt-label">Teacher H mean</span><span class="tt-val" style="color:#6fcfa0">${entMean}</span></div>
-      <div style="margin-top:7px;color:#7a8aaa;font-size:.71rem;white-space:pre-wrap;max-width:280px">${preview}</div>
+      <div class="tt-row"><span class="tt-label">Process Reward</span><span class="tt-val" style="color:${ms.process_reward >= 0 ? '#4caf50' : '#f44336'}">${prStr}</span></div>
+      <div class="tt-row"><span class="tt-label">Acc Rate</span><span class="tt-val">${ms.acc_rate !== undefined ? ms.acc_rate.toFixed(4) : '—'}</span></div>
     `;
     tooltip.style.display = 'block';
     let left = e.clientX + 16, top = e.clientY + 16;
     if (left + 300 > window.innerWidth)  left = e.clientX - 310;
-    if (top  + 240 > window.innerHeight) top  = e.clientY - 240;
+    if (top  + 260 > window.innerHeight) top  = e.clientY - 260;
     tooltip.style.left = left + 'px';
     tooltip.style.top  = top  + 'px';
     return;
   }
 
-  // ── Entropy bar tooltip ───────────────────────────────────────────────
+  // ── Entropy bar tooltip (merged segments) ────────────────────────────
   if (el.classList.contains('ent-seg')) {
-    const ci  = parseInt(el.dataset.ci);
-    const si  = parseInt(el.dataset.si);
-    const seg = DATA[ci].segments[si];
-    const alpha  = parseFloat(alphaSlider.value);
-    const mixed  = (alpha * seg.kl_forward_mean + (1 - alpha) * seg.kl_reverse_mean).toFixed(4);
-    const entMean = (seg.teacher_entropy_mean || 0).toFixed(4);
-    const preview = seg.text_preview
-      ? htmlSafe(seg.text_preview.substring(0, 120)) + (seg.text_preview.length > 120 ? '…' : '')
-      : '';
+    const ci = parseInt(el.dataset.ci);
+    const mi = parseInt(el.dataset.mi);
+    const ms = (DATA[ci].merged_segments || [])[mi];
+    if (!ms) { tooltip.style.display = 'none'; return; }
+    const alpha   = parseFloat(alphaSlider.value);
+    const mixed   = (alpha * ms.kl_forward_mean + (1 - alpha) * ms.kl_reverse_mean).toFixed(4);
+    const entMean = (ms.teacher_entropy_mean || 0).toFixed(4);
+    const prStr   = ms.process_reward !== undefined
+      ? (ms.process_reward >= 0 ? '+' : '') + ms.process_reward.toFixed(4) : '—';
+    const epRange = ms.orig_ep_start === ms.orig_ep_end
+      ? `Ep ${ms.orig_ep_start}` : `Ep ${ms.orig_ep_start}–${ms.orig_ep_end}`;
     tooltip.innerHTML = `
-      <div class="tt-token" style="color:#6fcfa0">Episode ${si + 1} — Teacher Entropy</div>
-      <div class="tt-row"><span class="tt-label">Tokens</span><span class="tt-val">${seg.length}</span></div>
+      <div class="tt-token" style="color:#6fcfa0">${epRange} (merged) — Teacher Entropy</div>
+      <div class="tt-row"><span class="tt-label">Tokens</span><span class="tt-val">${ms.length}</span></div>
       <div class="tt-row"><span class="tt-label">Teacher H mean</span><span class="tt-val" style="color:#6fcfa0;font-size:1.05rem">${entMean}</span></div>
       <div class="tt-row"><span class="tt-label">Mixed KL (ref)</span><span class="tt-val" style="color:#888">${mixed}</span></div>
-      <div style="margin-top:7px;color:#7a8aaa;font-size:.71rem;white-space:pre-wrap;max-width:280px">${preview}</div>
+      <div class="tt-row"><span class="tt-label">Process Reward</span><span class="tt-val" style="color:${ms.process_reward >= 0 ? '#4caf50' : '#f44336'}">${prStr}</span></div>
     `;
     tooltip.style.display = 'block';
     let left = e.clientX + 16, top = e.clientY + 16;
     if (left + 300 > window.innerWidth)  left = e.clientX - 310;
-    if (top  + 200 > window.innerHeight) top  = e.clientY - 200;
+    if (top  + 220 > window.innerHeight) top  = e.clientY - 220;
     tooltip.style.left = left + 'px';
     tooltip.style.top  = top  + 'px';
     return;
@@ -1146,12 +1429,13 @@ document.addEventListener('mousemove', e => {
   const ci = parseInt(el.dataset.ci);
   const ti = parseInt(el.dataset.ti);
   const tok = DATA[ci].tokens[ti];
-  const segIdx = tok.segment !== undefined ? tok.segment : '—';
+  const segIdx = tok.merged_segment !== undefined ? tok.merged_segment
+               : (tok.segment !== undefined ? tok.segment : '—');
 
   tooltip.innerHTML = `
     <div class="tt-token">"${htmlSafe(tok.text)}"</div>
     <div class="tt-row"><span class="tt-label">Position</span><span class="tt-val">${ti}</span></div>
-    <div class="tt-row"><span class="tt-label">Episode</span><span class="tt-val">${typeof segIdx === 'number' ? segIdx + 1 : segIdx}</span></div>
+    <div class="tt-row"><span class="tt-label">Merged ep</span><span class="tt-val">${typeof segIdx === 'number' ? segIdx + 1 : segIdx}</span></div>
     <div class="tt-row"><span class="tt-label">Region</span><span class="tt-val">${tok.region || 'answer'}</span></div>
     <div class="tt-row"><span class="tt-label">Token ID</span><span class="tt-val">${tok.token_id}</span></div>
     <div class="tt-row"><span class="tt-label">KL(T‖S) fwd</span><span class="tt-val">${tok.kl_forward.toFixed(4)}</span></div>
@@ -1180,13 +1464,13 @@ renderAll();
 </html>"""
 
 
-def phase4_html(case_data):
+def phase6_html(case_data):
     if not case_data:
         print("  No case data — skipping HTML generation.", flush=True)
         return
 
     print(f"\n{'='*60}")
-    print(f"Phase 4: Generating interactive HTML")
+    print(f"Phase 6: Generating interactive HTML")
     print(f"{'='*60}", flush=True)
 
     json_blob = json.dumps(case_data, ensure_ascii=False)
@@ -1196,6 +1480,7 @@ def phase4_html(case_data):
     html = html.replace('__STUDENT__', os.path.basename(STUDENT_MODEL))
     html = html.replace('__TEACHER__', os.path.basename(TEACHER_MODEL))
     html = html.replace('__DATASET__', DATASET)
+    html = html.replace('__TEACHER_CONT_TOKENS__', str(TEACHER_CONT_TOKENS))
 
     with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
         f.write(html)
@@ -1221,9 +1506,11 @@ def main():
     samples = load_dataset_samples()
 
     student_results, student_tok = phase1_student(samples)
-    selected = phase2_teacher(samples, student_results)
+    selected  = phase2_teacher(samples, student_results)
     case_data = phase3_kl(student_results, selected, student_tok)
-    phase4_html(case_data)
+    eval_items = phase4_episode_eval(case_data)
+    case_data  = phase5_merge_and_continuations(case_data, eval_items)
+    phase6_html(case_data)
 
     # ── Response length comparison ────────────────────────────────────────
     print(f"\n{'='*60}")

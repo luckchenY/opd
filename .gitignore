@@ -158,6 +158,7 @@ output_grpo/
 # tools 下蒸馏/训练生成的大目录（保留 *.py 等源码）
 tools/weighted_distill_output*/
 tools/correction_distill_output*/
+tools/analyze_pr_kl_merged_ckpts/
 
 # 模型与常见大权重（只传代码不传模型）
 *.safetensors

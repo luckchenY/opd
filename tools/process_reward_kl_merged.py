@@ -19,6 +19,7 @@ monotonic-run merging step before the scatter analysis:
               (ep5)                 (ep7)                  (ep8)
 
 Phases 1–4 and Phase 6 are unchanged from process_reward_kl.py.
+分析这个KL和process reward之间的关系
 
 Usage:
     python tools/process_reward_kl_merged.py
@@ -34,9 +35,9 @@ import re
 from collections import defaultdict
 
 import numpy as np
-import pyarrow.ipc as ipc
 import torch
 import torch.nn.functional as F
+from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 
@@ -48,32 +49,19 @@ except ImportError:
     print("WARNING: scipy not found; Pearson p-values will be NaN.", flush=True)
 
 # ── config ────────────────────────────────────────────────────────────────────
-STUDENT_MODEL = (
-    "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen"
-    "/models/Qwen3-1.7B"
-)
-TEACHER_MODEL = (
-    "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen"
-    "/models/Qwen3-8B"
-)
-EVAL_MODEL = os.environ.get("EVAL_MODEL", STUDENT_MODEL)
+STUDENT_MODEL = os.environ.get("STUDENT_MODEL", "Qwen/Qwen3-1.7B")
+TEACHER_MODEL = os.environ.get("TEACHER_MODEL", "Qwen/Qwen3-32B")
+EVAL_MODEL    = os.environ.get("EVAL_MODEL",    STUDENT_MODEL)
 
-DATASET = "hendrycks_math"
-_CACHE_ROOT = (
-    "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift"
-    "/data/hf_datasets_cache"
-)
+DATASET  = "hendrycks_math"
+_DATA_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 DATASET_CONFIGS = {
     "hendrycks_math": {
-        "arrow_shards": [
-            f"{_CACHE_ROOT}/EleutherAI___hendrycks_math/{subset}/0.0.0"
-            "/21a5633873b6a120296cce3e2df9d5550074f4a3/hendrycks_math-train.arrow"
-            for subset in [
-                "algebra", "counting_and_probability", "geometry",
-                "intermediate_algebra", "number_theory", "prealgebra", "precalculus",
-            ]
+        "subsets": [
+            "algebra", "counting_and_probability", "geometry",
+            "intermediate_algebra", "number_theory", "prealgebra", "precalculus",
         ],
-        "prompt_key": "problem",
+        "prompt_key":   "problem",
         "solution_key": "solution",
     },
 }
@@ -198,22 +186,16 @@ def build_prompt(problem_text, tokenizer):
 
 def load_dataset_samples():
     random.seed(SEED)
-    cfg = DATASET_CONFIGS[DATASET]
-    shards = cfg["arrow_shards"]
-    print(f"Loading dataset '{DATASET}' ({len(shards)} shards) …", flush=True)
+    cfg     = DATASET_CONFIGS[DATASET]
+    subsets = cfg["subsets"]
+    print(f"Loading dataset '{DATASET}' ({len(subsets)} subsets) …", flush=True)
     pool = []
-    for shard_path in shards:
-        reader = ipc.open_stream(shard_path)
-        while True:
-            try:
-                batch = reader.read_next_batch()
-            except StopIteration:
-                break
-            for i in range(len(batch)):
-                pool.append({col: batch.column(col)[i].as_py()
-                             for col in batch.schema.names})
+    for subset in subsets:
+        path = os.path.join(_DATA_ROOT, DATASET, subset)
+        ds   = load_from_disk(path)
+        pool.extend(ds)
     total = len(pool)
-    idx = random.sample(range(total), min(N_SAMPLES, total))
+    idx     = random.sample(range(total), min(N_SAMPLES, total))
     samples = [pool[i] for i in idx]
     del pool
     print(f"  Sampled {len(samples)} / {total} rows", flush=True)
