@@ -143,7 +143,16 @@ Important env vars
                               few indices that still miss are filled with
                               a small fallback logprob. Default 256.
   KL_VLLM_GPU_UTIL            gpu_memory_utilization passed to the Step 4
-                              vLLM engines. Default 0.85.
+                              vLLM engines. Default 0.80 (leaves headroom
+                              for the ephemeral fp32 log_softmax tensor
+                              that prompt_logprobs allocates).
+  KL_VLLM_MAX_NUM_BATCHED_TOKENS
+                              vLLM scheduler cap on prompt tokens per
+                              prefill step. Each batched token costs
+                              ~600 KB of fp32 log_softmax memory on a
+                              152k-vocab model; vLLM's default (16384)
+                              would cost ~9 GB ephemeral and OOM on
+                              80 GB cards. Default 2048.
   OPD_REVERSE_KL_BETA         beta in  L = beta*KL(s||t) + (1-beta)*KL(t||s).
                               Default 0.7 (reverse-leaning, mode-seeking).
   OPD_TEMP                    Softmax temperature in the KL. Default 1.0.
@@ -304,9 +313,22 @@ if KL_VLLM_STUDENT_LOGPROBS < KL_TOPK:
         f">= KL_TOPK ({KL_TOPK})"
     )
 
-# gpu_memory_utilization for the Step 4 vLLM engines. Lower if running
-# alongside other GPU work on the same cards.
-KL_VLLM_GPU_UTIL = float(os.environ.get("KL_VLLM_GPU_UTIL", "0.85"))
+# gpu_memory_utilization for the Step 4 vLLM engines. The default 0.80
+# (was 0.85) leaves a ~10 GB headroom per card so vLLM can allocate the
+# ephemeral [N, V] fp32 log_softmax tensor used by prompt_logprobs.
+# Lower further if you still OOM in `_get_prompt_logprobs_dict`.
+KL_VLLM_GPU_UTIL = float(os.environ.get("KL_VLLM_GPU_UTIL", "0.80"))
+
+# vLLM scheduler knob: max prompt tokens batched per prefill step. The
+# prompt_logprobs path materialises a `[max_num_batched_tokens, vocab]`
+# fp32 tensor for log_softmax; vLLM's default (16384) costs ~9 GB on a
+# 152k-vocab model. We cap at 2048 by default (~1.2 GB on the same model)
+# so the ephemeral tensor comfortably fits within the headroom left by
+# `KL_VLLM_GPU_UTIL`. Larger values give higher throughput but risk OOM
+# on 80 GB cards with the 32B teacher.
+KL_VLLM_MAX_NUM_BATCHED_TOKENS = int(
+    os.environ.get("KL_VLLM_MAX_NUM_BATCHED_TOKENS", "2048")
+)
 
 # Student vLLM (Step 1-3 rollout/K-fold, Step 7 eval) is ALWAYS data-parallel:
 # one worker per visible GPU, TP=1 inside each worker.
@@ -1429,12 +1451,15 @@ def _vllm_score_prompts(cfg_path):
     out_pt        = cfg["out_pt"]
     max_model_len = int(cfg.get("max_model_len", 0)) or None
     gpu_util      = float(cfg.get("gpu_util", 0.85))
+    max_num_batched_tokens = int(cfg.get("max_num_batched_tokens", 0)) or None
 
     enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "1") != "0"
     cvd           = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     print(f"  [vLLM/{role}] init  model={os.path.basename(model_path)}  "
           f"tp={tp}  prompt_logprobs={logprobs_k}  "
           f"max_model_len={max_model_len}  "
+          f"max_num_batched_tokens={max_num_batched_tokens}  "
+          f"gpu_util={gpu_util}  "
           f"CUDA_VISIBLE_DEVICES={cvd}", flush=True)
 
     llm = LLM(
@@ -1447,6 +1472,7 @@ def _vllm_score_prompts(cfg_path):
         enable_prefix_caching=False,
         enforce_eager=enforce_eager,
         max_logprobs=max(1, logprobs_k),
+        max_num_batched_tokens=max_num_batched_tokens,
     )
     sp = SamplingParams(
         n=1, temperature=0.0, max_tokens=1,
@@ -1663,9 +1689,10 @@ def _epoch_kl_worker(cfg_path, out_path):
     # buffer is harmless and avoids edge cases on tokeniser oddities).
     scoring_max_len = EPOCH_MAX_MODEL_LEN + 8
     common = {
-        "prompts_path":  str(pending_pt),
-        "max_model_len": scoring_max_len,
-        "gpu_util":      KL_VLLM_GPU_UTIL,
+        "prompts_path":           str(pending_pt),
+        "max_model_len":          scoring_max_len,
+        "gpu_util":               KL_VLLM_GPU_UTIL,
+        "max_num_batched_tokens": KL_VLLM_MAX_NUM_BATCHED_TOKENS,
     }
     with open(s_cfg_path, "w") as f:
         json.dump({**common, "role": "student",
@@ -3232,6 +3259,8 @@ def main():
           f"(student prompt_logprobs window — covers teacher top-K)")
     print(f"  KL_VLLM_GPU_UTIL           = {KL_VLLM_GPU_UTIL}  "
           f"(gpu_memory_utilization for Step 4 vLLM engines)")
+    print(f"  KL_VLLM_MAX_NUM_BATCHED_TOKENS = {KL_VLLM_MAX_NUM_BATCHED_TOKENS}  "
+          f"(cap on prefill batch — bounds ephemeral fp32 log_softmax)")
     print(f"  student vLLM (Step 1-3, 7) = DP only  "
           f"(workers={N_GPUS}, tp=1 per worker)")
     print(f"  OPD_REVERSE_KL_BETA        = {OPD_REVERSE_KL_BETA}")
