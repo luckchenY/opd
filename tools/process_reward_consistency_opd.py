@@ -1186,6 +1186,40 @@ def _build_merged_paragraphs(segments, ep_accs, empty_acc):
     return out
 
 
+def _largest_divisor_le(n, cap):
+    """Largest d in [1, cap] with n % d == 0. Used to find a TP size that
+    divides num_attention_heads."""
+    cap = max(1, int(cap))
+    n   = max(1, int(n))
+    for d in range(min(n, cap), 0, -1):
+        if n % d == 0:
+            return d
+    return 1
+
+
+def _vllm_compatible_tp(model_path, max_tp):
+    """Pick the largest tensor-parallel size <= max_tp that divides the
+    model's attention-head count. vLLM rejects any TP that does not divide
+    ``num_attention_heads`` (and, for GQA models, ``num_key_value_heads``)
+    with a pydantic error at engine init."""
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        n_heads = int(getattr(cfg, "num_attention_heads", max_tp))
+        n_kv    = int(getattr(cfg, "num_key_value_heads", n_heads))
+    except Exception:
+        return max(1, int(max_tp))
+    tp = _largest_divisor_le(n_heads, max_tp)
+    # Also satisfy GQA constraint: tp must divide num_key_value_heads (or
+    # vice versa; vLLM allows tp <= n_kv when n_kv % tp == 0). When n_kv
+    # is smaller than tp (rare for big LLMs), fall back to n_kv.
+    while tp > 1 and (n_kv % tp != 0 and tp % n_kv != 0):
+        tp -= 1
+        while tp > 1 and n_heads % tp != 0:
+            tp -= 1
+    return max(1, tp)
+
+
 def _kl_prepare_or_skip(rec, orig_idx, student_tok):
     """Return (None, skip_dict) or (prepared_dict, None) for KL forward."""
     if rec.get("skipped"):
@@ -1420,7 +1454,25 @@ def _vllm_score_prompts(cfg_path):
     )
 
     items_blob = torch.load(prompts_path, map_location="cpu")
-    items = items_blob["items"]
+    items_raw  = items_blob["items"]
+
+    # vLLM requires prompt_len + max_tokens <= max_model_len. Filter out
+    # any (prompt+response) sequences that would overflow even with our
+    # +headroom max_model_len; they'll be flagged as missing_vllm_logprobs
+    # by the parent and routed through the normal skip path.
+    budget = (max_model_len or 10 ** 9) - 1
+    items, dropped = [], []
+    for it in items_raw:
+        seq_len = len(it["prompt_ids"]) + len(it["response_ids"])
+        if seq_len > budget:
+            dropped.append((it["orig_idx"], seq_len))
+        else:
+            items.append(it)
+    if dropped:
+        sample = ", ".join(f"idx={i}({l})" for i, l in dropped[:5])
+        more   = "" if len(dropped) <= 5 else f"  +{len(dropped) - 5} more"
+        print(f"  [vLLM/{role}] WARN: dropping {len(dropped)} over-length "
+              f"prompts (> {budget} tokens): {sample}{more}", flush=True)
     print(f"  [vLLM/{role}] scoring {len(items)} prompts …", flush=True)
 
     prompts_arg = [
@@ -1557,8 +1609,30 @@ def _epoch_kl_worker(cfg_path, out_path):
         # Only one GPU available → share it sequentially (teacher then student).
         student_phys = teacher_phys = physical[:1]
         run_in_parallel = False
-    student_tp = 1
-    teacher_tp = len(teacher_phys)
+    student_tp_req = 1
+    teacher_tp_req = len(teacher_phys)
+
+    # vLLM requires TP to divide num_attention_heads (and respect GQA on
+    # num_key_value_heads). 1.7B student is fine at TP=1; the 32B teacher
+    # has 64 heads → valid TPs are {1,2,4,8,…}. If KL_GPUS_PER_WORKER
+    # leaves an awkward count of teacher GPUs (e.g. 3) we reduce TP to the
+    # nearest divisor and leave the surplus cards idle this step.
+    student_tp = _vllm_compatible_tp(student_ckpt, student_tp_req)
+    teacher_tp = _vllm_compatible_tp(teacher_path,  teacher_tp_req)
+    if teacher_tp != teacher_tp_req:
+        idle = teacher_phys[teacher_tp:]
+        teacher_phys = teacher_phys[:teacher_tp]
+        print(f"  [warn] teacher TP={teacher_tp_req} does NOT divide "
+              f"num_attention_heads of {os.path.basename(teacher_path)}; "
+              f"reducing to TP={teacher_tp}. GPUs {idle} sit idle. "
+              f"Tip: set KL_GPUS_PER_WORKER = 1 + TP (e.g. 5 for TP=4) "
+              f"to use all cards.", flush=True)
+    if student_tp != student_tp_req:
+        idle = student_phys[student_tp:]
+        student_phys = student_phys[:student_tp]
+        print(f"  [warn] student TP={student_tp_req} does NOT divide head "
+              f"count of {os.path.basename(student_ckpt)}; reducing to "
+              f"TP={student_tp}. GPUs {idle} sit idle.", flush=True)
     print(f"  KL layout (vLLM): student GPUs={student_phys} TP={student_tp}  "
           f"teacher GPUs={teacher_phys} TP={teacher_tp}  "
           f"parallel={run_in_parallel}", flush=True)
@@ -1583,9 +1657,14 @@ def _epoch_kl_worker(cfg_path, out_path):
 
     student_K = max(topk, KL_VLLM_STUDENT_LOGPROBS)
     teacher_K = topk
+    # Scoring always requests max_tokens=1; vLLM enforces
+    # prompt_len + max_tokens <= max_model_len. Rollouts in Step 1 can
+    # land EXACTLY on EPOCH_MAX_MODEL_LEN, so we need +1 (a small extra
+    # buffer is harmless and avoids edge cases on tokeniser oddities).
+    scoring_max_len = EPOCH_MAX_MODEL_LEN + 8
     common = {
         "prompts_path":  str(pending_pt),
-        "max_model_len": EPOCH_MAX_MODEL_LEN,
+        "max_model_len": scoring_max_len,
         "gpu_util":      KL_VLLM_GPU_UTIL,
     }
     with open(s_cfg_path, "w") as f:
