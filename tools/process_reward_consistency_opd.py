@@ -61,15 +61,24 @@ We make the following deliberate design choices:
    top-K objective and is much cheaper than full-vocab KL.
 
 6. Teacher top-K is CACHED to disk, not recomputed at train time.
-   The KL phase (Step 4) already forwards the teacher to obtain top-K
-   indices + raw logits per response position. Instead of discarding them
-   after computing the per-paragraph scalar normKL, we serialise them to
-   a binary `.pt` cache keyed by rollout index. Step 6 (training) loads
-   the cache and never instantiates the teacher on GPU at all. This is
-   what lets us use arbitrarily large teachers (e.g. 32B) for OPD without
-   exhausting per-rank GPU memory in DDP — the only train-time GPU cost
-   is the student itself. The cache is deleted at the end of each epoch
-   (after eval) so disk usage stays bounded to a single epoch's worth.
+   The KL phase (Step 4) already forwards the teacher via vLLM
+   prompt_logprobs to obtain top-K (vocab_index, logprob) per response
+   position. Instead of discarding them after computing the per-paragraph
+   scalar normKL, we serialise them to a binary `.pt` cache keyed by
+   rollout index. Step 6 (training) loads the cache and never instantiates
+   the teacher on GPU at all. This is what lets us use arbitrarily large
+   teachers (e.g. 32B) for OPD without exhausting per-rank GPU memory in
+   DDP — the only train-time GPU cost is the student itself. The cache
+   is deleted at the end of each epoch (after eval) so disk usage stays
+   bounded to a single epoch's worth.
+
+   NOTE: the cache field is named ``topk_logits`` for historical reasons
+   but in vLLM mode it holds the top-K **logprobs**. Step 6 only ever
+   passes the cache through ``log_softmax(cache / T)`` and gathers the
+   student against the cached indices, for which raw logits and logprobs
+   are mathematically identical (the global ``logsumexp`` shift cancels
+   inside the softmax). Cache header carries ``schema_version=2`` and
+   ``logprobs_in_cache=True`` to make the encoding explicit.
 
 Per-epoch pipeline
 ------------------
@@ -77,11 +86,15 @@ Per-epoch pipeline
   Step 2  CPU            : segment each response (trigger words + period count)
   Step 3  vLLM (student) : K-fold PR eval per segment + empty-prefix baseline
                            (written into a single rollouts.jsonl file)
-  Step 4  HF (s + t)     : batched per-token KL on teacher Top-K support
-                           (KL_BATCH_SIZE micro-batches; student+teacher
-                           forwards run in parallel when on disjoint GPUs)
-                           into length-weighted normKL per MERGED paragraph
-                           (monotonic-run merge over per-segment PR)
+  Step 4  vLLM (s + t)   : per-token KL on teacher Top-K support via vLLM
+                           prompt_logprobs. Student vLLM (TP=1, first GPU)
+                           and teacher vLLM (TP=N-1, remaining GPUs) run as
+                           parallel subprocesses on disjoint GPU slices.
+                           Each engine batches internally via vLLM's
+                           continuous batcher; we just gather student
+                           logprobs at teacher's top-K indices and reduce
+                           to length-weighted normKL per MERGED paragraph
+                           (monotonic-run merge over per-segment PR).
   Step 5  CPU            : (a) per-merged-paragraph inconsistency scores;
                            (b) per-response consistency ratio;
                            (c) global response ranking, top-X% selection;
@@ -119,16 +132,18 @@ Important env vars
   KL_TOPK                     Teacher top-K support set size for all KL
                               computations (offline + training loss).
                               Default 64.
-  KL_GPUS_PER_WORKER          GPUs each KL worker uses. The KL phase is
-                              data-parallel across GPUs: total workers =
-                              N_GPUS // KL_GPUS_PER_WORKER. Default 4 for
-                              large teachers (32B+): student on GPU 0,
-                              teacher device_map on the rest. Set to 1 only
-                              when both models fit on one card.
-  KL_BATCH_SIZE               HF forward micro-batch in Step 4 (pad-left
-                              batching). Default 4. Lower if OOM.
-                              When student and teacher sit on disjoint GPUs
-                              within a worker, both forwards run in parallel.
+  KL_GPUS_PER_WORKER          GPUs per KL subprocess (CUDA_VISIBLE_DEVICES
+                              slice). Inside each worker, student vLLM
+                              takes cuda:0 (TP=1) and teacher vLLM takes
+                              cuda:1..N-1 (TP=N-1). Workers =
+                              N_GPUS // KL_GPUS_PER_WORKER. Default 4.
+  KL_VLLM_STUDENT_LOGPROBS    Width of student's prompt_logprobs window in
+                              Step 4. Must be >= KL_TOPK; a wider window
+                              maximises overlap with teacher's top-K. The
+                              few indices that still miss are filled with
+                              a small fallback logprob. Default 256.
+  KL_VLLM_GPU_UTIL            gpu_memory_utilization passed to the Step 4
+                              vLLM engines. Default 0.85.
   OPD_REVERSE_KL_BETA         beta in  L = beta*KL(s||t) + (1-beta)*KL(t||s).
                               Default 0.7 (reverse-leaning, mode-seeking).
   OPD_TEMP                    Softmax temperature in the KL. Default 1.0.
@@ -264,21 +279,34 @@ if not (0.0 <= OPD_REVERSE_KL_BETA <= 1.0):
     raise ValueError(f"OPD_REVERSE_KL_BETA must be in [0,1], got {OPD_REVERSE_KL_BETA}")
 
 # ─── KL data-parallel knob ───────────────────────────────────────────────────
-# Number of GPUs each KL worker uses.
-#   1 → co-locate student + teacher on the same GPU; one DP worker per GPU
-#        (recommended on 80GB cards; max parallelism).
-#   2 → student on GPU 0 of the worker, teacher on GPU 1 of the worker
-#        (use when a single GPU cannot hold both bf16 models).
+# Number of GPUs each KL worker uses in Step 4. The worker slices its
+# CUDA_VISIBLE_DEVICES into:
+#   • cuda:0           → student vLLM (TP=1)
+#   • cuda:1..N-1      → teacher vLLM (TP=N-1)
+# These two child vLLM engines are launched as parallel subprocesses with
+# their own CUDA_VISIBLE_DEVICES, so the student and teacher forwards run
+# concurrently on disjoint GPUs. For a 32B teacher you typically need at
+# least 3 teacher GPUs → KL_GPUS_PER_WORKER=4 (1 student + 3 teacher).
 # Total parallel KL workers = N_GPUS // KL_GPUS_PER_WORKER.
 KL_GPUS_PER_WORKER  = int(os.environ.get("KL_GPUS_PER_WORKER", "4"))
 if KL_GPUS_PER_WORKER < 1:
     raise ValueError(f"KL_GPUS_PER_WORKER must be >= 1, got {KL_GPUS_PER_WORKER}")
 
-# Step 4: pad-left micro-batch for HF student+teacher forward. When student
-# and teacher occupy disjoint GPUs in a worker, both forwards run in parallel.
-KL_BATCH_SIZE = int(os.environ.get("KL_BATCH_SIZE", "16"))
-if KL_BATCH_SIZE < 1:
-    raise ValueError(f"KL_BATCH_SIZE must be >= 1, got {KL_BATCH_SIZE}")
+# Student prompt_logprobs window in Step 4. Must be >= KL_TOPK; a wider
+# window maximises the chance that teacher's top-K vocab indices are
+# present in student's logprob dict (we gather student's lp at teacher's
+# indices; any index that isn't returned is filled with a tiny fallback
+# logprob and flagged in the per-record miss-rate).
+KL_VLLM_STUDENT_LOGPROBS = int(os.environ.get("KL_VLLM_STUDENT_LOGPROBS", "256"))
+if KL_VLLM_STUDENT_LOGPROBS < KL_TOPK:
+    raise ValueError(
+        f"KL_VLLM_STUDENT_LOGPROBS ({KL_VLLM_STUDENT_LOGPROBS}) must be "
+        f">= KL_TOPK ({KL_TOPK})"
+    )
+
+# gpu_memory_utilization for the Step 4 vLLM engines. Lower if running
+# alongside other GPU work on the same cards.
+KL_VLLM_GPU_UTIL = float(os.environ.get("KL_VLLM_GPU_UTIL", "0.85"))
 
 # Student vLLM (Step 1-3 rollout/K-fold, Step 7 eval) is ALWAYS data-parallel:
 # one worker per visible GPU, TP=1 inside each worker.
@@ -1158,68 +1186,6 @@ def _build_merged_paragraphs(segments, ep_accs, empty_acc):
     return out
 
 
-def _kl_can_parallel_forward(s_gpus, t_gpus):
-    """True when student and teacher sit on disjoint GPUs → dual forward."""
-    return (
-        len(s_gpus) > 0
-        and len(t_gpus) > 0
-        and set(s_gpus).isdisjoint(set(t_gpus))
-    )
-
-
-def _forward_hf_batch(model, input_ids, device):
-    """Forward a left-padded batch [B, T]. Returns [B, T, V] logits on CPU."""
-    input_ids = input_ids.to(device)
-    batch_size = input_ids.size(0)
-    with torch.no_grad():
-        try:
-            return model(input_ids=input_ids).logits.cpu()
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            if batch_size > 1:
-                mid = (batch_size + 1) // 2
-                a = _forward_hf_batch(model, input_ids[:mid], device)
-                b = _forward_hf_batch(model, input_ids[mid:], device)
-                return torch.cat([a, b], dim=0)
-            seq_len = input_ids.size(1)
-            chunk = 1024
-            parts = []
-            for st in range(0, seq_len, chunk):
-                ed = min(st + chunk, seq_len)
-                out = model(input_ids=input_ids[:, :ed]).logits[0, st:ed].cpu()
-                parts.append(out)
-                torch.cuda.empty_cache()
-            return torch.cat(parts, dim=0).unsqueeze(0)
-
-
-def _parallel_dual_forward_batch(
-    s_model, t_model, batch_ids, s_dev, t_dev, parallel,
-):
-    """Run student and teacher batch forwards; parallel when on disjoint GPUs."""
-    import concurrent.futures
-
-    if parallel:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            fs = pool.submit(_forward_hf_batch, s_model, batch_ids, s_dev)
-            ft = pool.submit(_forward_hf_batch, t_model, batch_ids, t_dev)
-            return fs.result(), ft.result()
-    s_logits = _forward_hf_batch(s_model, batch_ids, s_dev)
-    t_logits = _forward_hf_batch(t_model, batch_ids, t_dev)
-    return s_logits, t_logits
-
-
-def _pad_id_lists_for_batch(id_lists, pad_id):
-    """Left-pad variable-length id lists → [B, T] tensor + pad_left per row."""
-    max_len = max(len(ids) for ids in id_lists)
-    rows = []
-    pad_lefts = []
-    for ids in id_lists:
-        pad_left = max_len - len(ids)
-        rows.append([pad_id] * pad_left + list(ids))
-        pad_lefts.append(pad_left)
-    return torch.tensor(rows, dtype=torch.long), pad_lefts
-
-
 def _kl_prepare_or_skip(rec, orig_idx, student_tok):
     """Return (None, skip_dict) or (prepared_dict, None) for KL forward."""
     if rec.get("skipped"):
@@ -1263,11 +1229,26 @@ def _kl_prepare_or_skip(rec, orig_idx, student_tok):
     }, None
 
 
-def _kl_post_forward_record(
-    item, s_resp, t_resp, topk, beta, student_tok, teacher_cache,
-    cache_vocab_clip_ref,
+def _kl_post_vllm_record(
+    item, t_rec, s_rec, topk, beta, student_tok, teacher_cache,
 ):
-    """Build kl.jsonl record + optional teacher cache entry from resp logits."""
+    """Build kl.jsonl record + optional teacher cache entry from vLLM
+    prompt_logprobs.
+
+    ``t_rec`` / ``s_rec`` each carry per-response-position top-K
+    ``(token_id, logprob)`` lists. For every response position we:
+      1. take teacher's top-K vocab indices,
+      2. gather student's logprob at those indices from its wider top-K'
+         (missing → ``miss_fill``, flagged in the returned miss-rate),
+      3. compute KL on the K-subset by renormalising both sides via
+         log_softmax. This is mathematically identical to using raw
+         logits (constant shifts cancel inside softmax).
+
+    The cache field is still called ``topk_logits`` to keep the on-disk
+    schema stable for Step 6; in vLLM mode it holds *logprobs* — Step 6
+    only ever passes the cache through ``log_softmax(cache / T)``, for
+    which raw logits and logprobs are equivalent.
+    """
     import torch.nn.functional as F
 
     rec = item["rec"]
@@ -1276,42 +1257,72 @@ def _kl_post_forward_record(
     resp_len = item["resp_len"]
     response_ids = item["response_ids"]
 
-    Vs = s_resp.size(-1)
-    Vt = t_resp.size(-1)
-    V = min(Vs, Vt)
-    if Vs != V:
-        s_resp = s_resp[:, :V]
-    if Vt != V:
-        t_resp = t_resp[:, :V]
+    t_idx_list = t_rec["topk_indices"]
+    t_lp_list  = t_rec["topk_logprobs"]
+    s_idx_list = s_rec["topk_indices"]
+    s_lp_list  = s_rec["topk_logprobs"]
 
-    K = min(topk, V)
-    t_topk = t_resp.topk(K, dim=-1)
-    topk_idx = t_topk.indices
-    t_topk_logits = t_topk.values
-    s_topk_logits = s_resp.gather(-1, topk_idx)
+    kl_fwd_list = [0.0] * resp_len
+    kl_rev_list = [0.0] * resp_len
 
-    t_log = F.log_softmax(t_topk_logits, dim=-1)
-    s_log = F.log_softmax(s_topk_logits, dim=-1)
-    t_p = t_log.exp()
-    s_p = s_log.exp()
+    cache_idx_rows = []
+    cache_lp_rows  = []
 
-    kl_fwd = (t_p * (t_log - s_log)).sum(-1).tolist()
-    kl_rev = (s_p * (s_log - t_log)).sum(-1).tolist()
+    miss_fill = -30.0
+    n_missing_total = 0
+    n_compared_total = 0
+
+    for t in range(resp_len):
+        t_idx = t_idx_list[t] if t < len(t_idx_list) else []
+        t_lp  = t_lp_list[t]  if t < len(t_lp_list)  else []
+        s_idx = s_idx_list[t] if t < len(s_idx_list) else []
+        s_lp  = s_lp_list[t]  if t < len(s_lp_list)  else []
+
+        if not t_idx:
+            cache_idx_rows.append([0] * topk)
+            cache_lp_rows.append([miss_fill] * topk)
+            continue
+
+        s_map = {int(idx): float(lp) for idx, lp in zip(s_idx, s_lp)}
+
+        K = min(len(t_idx), topk)
+        sel_idx  = [int(i) for i in t_idx[:K]]
+        sel_t_lp = [float(v) for v in t_lp[:K]]
+        sel_s_lp = []
+        for idx in sel_idx:
+            v = s_map.get(idx)
+            if v is None:
+                n_missing_total += 1
+                sel_s_lp.append(miss_fill)
+            else:
+                sel_s_lp.append(v)
+        n_compared_total += K
+
+        pad_n = topk - K
+        cache_idx_rows.append(sel_idx + [0] * pad_n)
+        cache_lp_rows.append(sel_t_lp + [miss_fill] * pad_n)
+
+        t_tensor = torch.tensor(sel_t_lp, dtype=torch.float32)
+        s_tensor = torch.tensor(sel_s_lp, dtype=torch.float32)
+        t_log = F.log_softmax(t_tensor, dim=-1)
+        s_log = F.log_softmax(s_tensor, dim=-1)
+        t_p = t_log.exp()
+        s_p = s_log.exp()
+        kl_fwd_list[t] = float((t_p * (t_log - s_log)).sum())
+        kl_rev_list[t] = float((s_p * (s_log - t_log)).sum())
 
     if teacher_cache is not None:
         teacher_cache[str(orig_idx)] = {
-            "topk_indices": topk_idx.to(torch.int32).contiguous(),
-            "topk_logits": t_topk_logits.to(torch.bfloat16).contiguous(),
-            "prompt_len": int(prompt_len),
-            "resp_len": int(resp_len),
-            "topk": int(K),
-            "vocab_clip": int(V),
+            "topk_indices": torch.tensor(cache_idx_rows, dtype=torch.int32),
+            "topk_logits":  torch.tensor(cache_lp_rows,  dtype=torch.bfloat16),
+            "prompt_len":   int(prompt_len),
+            "resp_len":     int(resp_len),
+            "topk":         int(topk),
+            "vocab_clip":   -1,
         }
-        if cache_vocab_clip_ref[0] is None:
-            cache_vocab_clip_ref[0] = int(V)
 
     tok_char_starts = [0] * resp_len
-    tok_char_ends = [0] * resp_len
+    tok_char_ends   = [0] * resp_len
     pos = 0
     for t in range(resp_len):
         piece = student_tok.decode([response_ids[t]])
@@ -1335,54 +1346,156 @@ def _kl_post_forward_record(
         if not tok_indices:
             para["normKL_fwd"] = 0.0
             para["normKL_rev"] = 0.0
-            para["normKL"] = 0.0
-            para["tok_start"] = -1
-            para["tok_end"] = -1
+            para["normKL"]     = 0.0
+            para["tok_start"]  = -1
+            para["tok_end"]    = -1
             continue
-        fwd = sum(kl_fwd[t] for t in tok_indices) / len(tok_indices)
-        rev = sum(kl_rev[t] for t in tok_indices) / len(tok_indices)
+        fwd = sum(kl_fwd_list[t] for t in tok_indices) / len(tok_indices)
+        rev = sum(kl_rev_list[t] for t in tok_indices) / len(tok_indices)
         mix = beta * rev + (1.0 - beta) * fwd
         para["normKL_fwd"] = float(max(0.0, fwd))
         para["normKL_rev"] = float(max(0.0, rev))
-        para["normKL"] = float(max(0.0, mix))
-        para["tok_start"] = int(tok_indices[0])
-        para["tok_end"] = int(tok_indices[-1] + 1)
+        para["normKL"]     = float(max(0.0, mix))
+        para["tok_start"]  = int(tok_indices[0])
+        para["tok_end"]    = int(tok_indices[-1] + 1)
 
     rec_out = dict(rec)
-    rec_out["prompt_len"] = int(prompt_len)
-    rec_out["resp_len"] = int(resp_len)
+    rec_out["prompt_len"]        = int(prompt_len)
+    rec_out["resp_len"]          = int(resp_len)
     rec_out["merged_paragraphs"] = merged
-    rec_out["kl_topk"] = int(K)
-    rec_out["opd_beta_used"] = float(beta)
-    rec_out["_orig_idx"] = orig_idx
+    rec_out["kl_topk"]           = int(topk)
+    rec_out["opd_beta_used"]     = float(beta)
+    rec_out["_orig_idx"]         = orig_idx
+    rec_out["_kl_miss_rate"]     = (
+        n_missing_total / n_compared_total if n_compared_total else 0.0
+    )
     return rec_out
 
 
-def _epoch_kl_worker(cfg_path, out_path):
-    """HF-based per-token KL. Loads student + teacher; for each rollout
-    re-tokenises (prompt + response) and computes top-K-support KL per
-    response position. Emits per-merged-paragraph normKL_fwd / normKL_rev /
-    normKL_mix into kl.jsonl.
+def _vllm_score_prompts(cfg_path):
+    """Subprocess entry: load ONE vLLM engine and score the supplied prompt
+    sequences via prompt_logprobs.
 
-    The retokenisation strategy:
-      • prompt: tokenize(build_filter_prompt(problem)) — matches training
-      • response: use response_token_ids directly from the rollout (EXACT,
-                  on-policy)
-    This guarantees the IDs we feed both models match what vLLM produced.
+    Driven by ``--_kl-score-worker``. The KL worker (see ``_epoch_kl_worker``)
+    spawns this twice in parallel — once for student (TP=1 on the worker's
+    first GPU) and once for teacher (TP=N-1 on the remaining GPUs) — with
+    different ``CUDA_VISIBLE_DEVICES``. Each instance dumps a per-rollout
+    map of per-response-position top-K (token_id, logprob) to disk; the
+    parent then computes KL on CPU.
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from vllm import LLM, SamplingParams
 
     with open(cfg_path) as f:
         cfg = json.load(f)
-    student_ckpt   = cfg["student_ckpt"]
-    teacher_path   = cfg["teacher_model"]
-    rollouts_jsonl = cfg["rollouts_jsonl"]
-    kl_jsonl_out   = cfg["kl_jsonl_out"]
-    teacher_cache_out = cfg.get("teacher_cache_out")  # optional binary cache
-    beta           = float(cfg.get("opd_reverse_kl_beta", OPD_REVERSE_KL_BETA))
-    topk           = int(cfg.get("kl_topk", KL_TOPK))
-    shard_idx      = int(cfg.get("shard_idx", 0))
-    n_shards       = max(1, int(cfg.get("n_shards", 1)))
+    role          = cfg["role"]
+    model_path    = cfg["model_path"]
+    tp            = int(cfg["tp"])
+    prompts_path  = cfg["prompts_path"]
+    logprobs_k    = int(cfg["prompt_logprobs"])
+    out_pt        = cfg["out_pt"]
+    max_model_len = int(cfg.get("max_model_len", 0)) or None
+    gpu_util      = float(cfg.get("gpu_util", 0.85))
+
+    enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "1") != "0"
+    cvd           = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    print(f"  [vLLM/{role}] init  model={os.path.basename(model_path)}  "
+          f"tp={tp}  prompt_logprobs={logprobs_k}  "
+          f"max_model_len={max_model_len}  "
+          f"CUDA_VISIBLE_DEVICES={cvd}", flush=True)
+
+    llm = LLM(
+        model=model_path,
+        tensor_parallel_size=tp,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_util,
+        enable_prefix_caching=False,
+        enforce_eager=enforce_eager,
+        max_logprobs=max(1, logprobs_k),
+    )
+    sp = SamplingParams(
+        n=1, temperature=0.0, max_tokens=1,
+        prompt_logprobs=logprobs_k,
+    )
+
+    items_blob = torch.load(prompts_path, map_location="cpu")
+    items = items_blob["items"]
+    print(f"  [vLLM/{role}] scoring {len(items)} prompts …", flush=True)
+
+    prompts_arg = [
+        {"prompt_token_ids":
+            list(it["prompt_ids"]) + list(it["response_ids"])}
+        for it in items
+    ]
+    outputs = llm.generate(prompts=prompts_arg, sampling_params=sp)
+
+    result = {}
+    for it, out in zip(items, outputs):
+        prompt_len = int(it["prompt_len"])
+        resp_len   = len(it["response_ids"])
+        pl         = out.prompt_logprobs
+        topk_indices  = []
+        topk_logprobs = []
+        for t in range(resp_len):
+            pos  = prompt_len + t
+            dist = pl[pos] if (pl is not None and pos < len(pl)) else None
+            if not dist:
+                topk_indices.append([])
+                topk_logprobs.append([])
+                continue
+            entries = []
+            for tok_id, lp_obj in dist.items():
+                lp_val = getattr(lp_obj, "logprob", None)
+                if lp_val is None:
+                    try:
+                        lp_val = float(lp_obj)
+                    except (TypeError, ValueError):
+                        continue
+                entries.append((int(tok_id), float(lp_val)))
+            entries.sort(key=lambda x: x[1], reverse=True)
+            entries = entries[:logprobs_k]
+            topk_indices.append([e[0] for e in entries])
+            topk_logprobs.append([e[1] for e in entries])
+        result[str(it["orig_idx"])] = {
+            "topk_indices":  topk_indices,
+            "topk_logprobs": topk_logprobs,
+        }
+
+    torch.save({"role": role, "K": logprobs_k, "records": result}, out_pt)
+    print(f"  [vLLM/{role}] done → {out_pt}  ({len(result)} records)", flush=True)
+
+
+def _epoch_kl_worker(cfg_path, out_path):
+    """vLLM-based per-token KL on teacher Top-K support.
+
+    Layout (one KL worker):
+      • student vLLM: cuda:0 of this worker, TP=1, prompt_logprobs=K_s
+        (K_s = max(KL_TOPK, KL_VLLM_STUDENT_LOGPROBS)).
+      • teacher vLLM: cuda:1..N-1 of this worker, TP=N-1,
+        prompt_logprobs=KL_TOPK.
+    The two engines are spawned as parallel subprocesses with disjoint
+    CUDA_VISIBLE_DEVICES so they run concurrently and shut down cleanly.
+
+    Retokenisation:
+      • prompt: tokenize(build_filter_prompt(problem)) — matches training
+      • response: use ``response_token_ids`` directly from the rollout
+        (EXACT, on-policy). The IDs we feed both models match what vLLM
+        produced in the rollout phase.
+    """
+    from transformers import AutoTokenizer
+
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    student_ckpt      = cfg["student_ckpt"]
+    teacher_path      = cfg["teacher_model"]
+    rollouts_jsonl    = cfg["rollouts_jsonl"]
+    kl_jsonl_out      = cfg["kl_jsonl_out"]
+    teacher_cache_out = cfg.get("teacher_cache_out")
+    beta              = float(cfg.get("opd_reverse_kl_beta", OPD_REVERSE_KL_BETA))
+    topk              = int(cfg.get("kl_topk", KL_TOPK))
+    shard_idx         = int(cfg.get("shard_idx", 0))
+    n_shards          = max(1, int(cfg.get("n_shards", 1)))
 
     rollouts_all = load_jsonl(rollouts_jsonl)
     # Modulo sharding for load balance: skipped records resolve nearly
@@ -1397,72 +1510,16 @@ def _epoch_kl_worker(cfg_path, out_path):
                        "n_shards":  n_shards}, f)
         return
 
+    student_tok = AutoTokenizer.from_pretrained(student_ckpt, trust_remote_code=True)
+
     print(f"\n[KL worker {shard_idx + 1}/{n_shards}] processing "
           f"{len(rollouts)}/{len(rollouts_all)} rollouts  "
-          f"top-K={topk}  beta={beta}  kl_batch={KL_BATCH_SIZE}",
-          flush=True)
+          f"top-K={topk}  beta={beta}  mode=vLLM", flush=True)
 
-    # ── GPU layout: student on GPU 0, teacher on the rest if available. ──
-    visible = torch.cuda.device_count()
-    if visible >= 2:
-        s_gpus, t_gpus = [0], list(range(1, visible))
-    else:
-        s_gpus = t_gpus = [0]
-
-    def _device_map(model_name, gpu_ids):
-        if len(gpu_ids) == 1:
-            return f"cuda:{gpu_ids[0]}"
-        from accelerate import infer_auto_device_map, init_empty_weights
-        from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        with init_empty_weights():
-            empty = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-        max_mem = {}
-        for i in gpu_ids:
-            gib = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
-            max_mem[i] = f"{max(1, int(gib * 0.82))}GiB"
-        max_mem["cpu"] = "32GiB"
-        dmap = infer_auto_device_map(empty, max_memory=max_mem)
-        del empty
-        return dmap
-
-    print(f"  Loading teacher ({os.path.basename(teacher_path)}) on GPUs {t_gpus} …",
-          flush=True)
-    t_model = AutoModelForCausalLM.from_pretrained(
-        teacher_path,
-        torch_dtype=torch.bfloat16,
-        device_map=_device_map(teacher_path, t_gpus),
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    ).eval()
-    print(f"  Loading student ({os.path.basename(student_ckpt)}) on GPUs {s_gpus} …",
-          flush=True)
-    s_model = AutoModelForCausalLM.from_pretrained(
-        student_ckpt,
-        torch_dtype=torch.bfloat16,
-        device_map=_device_map(student_ckpt, s_gpus),
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    ).eval()
-
-    s_dev = f"cuda:{s_gpus[0]}"
-    t_dev = f"cuda:{t_gpus[0]}"
-    parallel_fwd = _kl_can_parallel_forward(s_gpus, t_gpus)
-    print(f"  KL layout: student GPUs {s_gpus}  teacher GPUs {t_gpus}  "
-          f"parallel_s+t={parallel_fwd}", flush=True)
-
-    student_tok = AutoTokenizer.from_pretrained(student_ckpt, trust_remote_code=True)
-    pad_id = student_tok.pad_token_id
-    if pad_id is None:
-        pad_id = student_tok.eos_token_id
-
+    # ── Skip resolution / pending prep ─────────────────────────────────
     kl_records = []
-    n_with_kl  = 0
     n_skipped  = 0
     pending    = []
-    teacher_cache = {} if teacher_cache_out else None
-    cache_vocab_clip_ref = [None]
-
     for orig_idx, rec in rollouts:
         prepared, skip_out = _kl_prepare_or_skip(rec, orig_idx, student_tok)
         if skip_out is not None:
@@ -1471,73 +1528,188 @@ def _epoch_kl_worker(cfg_path, out_path):
             continue
         pending.append(prepared)
 
-    n_batches = max(1, (len(pending) + KL_BATCH_SIZE - 1) // KL_BATCH_SIZE)
-    print(f"  KL forward: {len(pending)} records  "
-          f"batch_size={KL_BATCH_SIZE}  n_batches={n_batches}", flush=True)
+    if not pending:
+        write_jsonl(kl_jsonl_out, kl_records)
+        with open(out_path, "w") as f:
+            json.dump({"n_with_kl":  0,
+                       "n_skipped":  n_skipped,
+                       "n_total":    len(kl_records),
+                       "n_cached":   0,
+                       "shard_idx":  shard_idx,
+                       "n_shards":   n_shards}, f)
+        print(f"\n[KL worker {shard_idx + 1}/{n_shards}] no pending records "
+              f"(all skipped: {n_skipped})", flush=True)
+        return
 
-    processed = 0
-    for b_idx in range(n_batches):
-        b_start = b_idx * KL_BATCH_SIZE
-        b_end   = min(b_start + KL_BATCH_SIZE, len(pending))
-        batch_items = pending[b_start:b_end]
+    # ── GPU slicing for the two child engines ──────────────────────────
+    parent_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if parent_cvd:
+        physical = [s.strip() for s in parent_cvd.split(",") if s.strip()]
+    else:
+        physical = [str(i) for i in range(torch.cuda.device_count())]
+    n_visible = max(1, len(physical))
 
-        batch_tensor, pad_lefts = _pad_id_lists_for_batch(
-            [it["full_ids_list"] for it in batch_items], pad_id,
+    if n_visible >= 2:
+        student_phys = [physical[0]]
+        teacher_phys = physical[1:]
+        run_in_parallel = True
+    else:
+        # Only one GPU available → share it sequentially (teacher then student).
+        student_phys = teacher_phys = physical[:1]
+        run_in_parallel = False
+    student_tp = 1
+    teacher_tp = len(teacher_phys)
+    print(f"  KL layout (vLLM): student GPUs={student_phys} TP={student_tp}  "
+          f"teacher GPUs={teacher_phys} TP={teacher_tp}  "
+          f"parallel={run_in_parallel}", flush=True)
+
+    # ── Persist prompts + per-engine config; both children read them. ──
+    shard_dir   = Path(kl_jsonl_out).parent
+    pending_pt  = shard_dir / f"_kl_shard{shard_idx}_prompts.pt"
+    s_cfg_path  = shard_dir / f"_kl_shard{shard_idx}_student_cfg.json"
+    t_cfg_path  = shard_dir / f"_kl_shard{shard_idx}_teacher_cfg.json"
+    s_out_path  = shard_dir / f"_kl_shard{shard_idx}_student_lp.pt"
+    t_out_path  = shard_dir / f"_kl_shard{shard_idx}_teacher_lp.pt"
+
+    items_blob = []
+    for it in pending:
+        items_blob.append({
+            "orig_idx":     it["orig_idx"],
+            "prompt_ids":   list(it["full_ids_list"][:it["prompt_len"]]),
+            "response_ids": list(it["response_ids"]),
+            "prompt_len":   int(it["prompt_len"]),
+        })
+    torch.save({"items": items_blob}, pending_pt)
+
+    student_K = max(topk, KL_VLLM_STUDENT_LOGPROBS)
+    teacher_K = topk
+    common = {
+        "prompts_path":  str(pending_pt),
+        "max_model_len": EPOCH_MAX_MODEL_LEN,
+        "gpu_util":      KL_VLLM_GPU_UTIL,
+    }
+    with open(s_cfg_path, "w") as f:
+        json.dump({**common, "role": "student",
+                   "model_path":      student_ckpt,
+                   "tp":              student_tp,
+                   "prompt_logprobs": student_K,
+                   "out_pt":          str(s_out_path)}, f)
+    with open(t_cfg_path, "w") as f:
+        json.dump({**common, "role": "teacher",
+                   "model_path":      teacher_path,
+                   "tp":              teacher_tp,
+                   "prompt_logprobs": teacher_K,
+                   "out_pt":          str(t_out_path)}, f)
+
+    print(f"  Spawning vLLM scoring subprocesses  "
+          f"(student_logprobs={student_K}  teacher_logprobs={teacher_K}) …",
+          flush=True)
+
+    def _start(role, cfg_p, phys):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(phys)
+        p = subprocess.Popen(
+            [sys.executable, __file__, "--_kl-score-worker", str(cfg_p)],
+            env=env,
         )
-        s_logits_b, t_logits_b = _parallel_dual_forward_batch(
-            s_model, t_model, batch_tensor, s_dev, t_dev, parallel_fwd,
-        )
+        print(f"    • {role}  pid={p.pid}  "
+              f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}",
+              flush=True)
+        return p
 
-        for bi, item in enumerate(batch_items):
-            pad_left = pad_lefts[bi]
-            seq_len  = item["seq_len"]
-            prompt_len = item["prompt_len"]
-            start = pad_left + prompt_len - 1
-            end   = pad_left + seq_len - 1
-            s_resp = s_logits_b[bi, start:end, :].float()
-            t_resp = t_logits_b[bi, start:end, :].float()
+    if run_in_parallel:
+        s_proc = _start("student", s_cfg_path, student_phys)
+        t_proc = _start("teacher", t_cfg_path, teacher_phys)
+        s_rc = s_proc.wait()
+        t_rc = t_proc.wait()
+    else:
+        t_proc = _start("teacher", t_cfg_path, teacher_phys)
+        t_rc = t_proc.wait()
+        if t_rc == 0:
+            s_proc = _start("student", s_cfg_path, student_phys)
+            s_rc = s_proc.wait()
+        else:
+            s_rc = 1
+    if s_rc != 0:
+        raise RuntimeError(f"student vLLM scoring failed (rc={s_rc})")
+    if t_rc != 0:
+        raise RuntimeError(f"teacher vLLM scoring failed (rc={t_rc})")
 
-            rec_out = _kl_post_forward_record(
-                item, s_resp, t_resp, topk, beta, student_tok,
-                teacher_cache, cache_vocab_clip_ref,
-            )
+    # ── CPU phase: gather + compute KL on the K-subset. ────────────────
+    print(f"  Loading vLLM scoring results …", flush=True)
+    s_blob = torch.load(s_out_path, map_location="cpu")
+    t_blob = torch.load(t_out_path, map_location="cpu")
+    s_records = s_blob["records"]
+    t_records = t_blob["records"]
+
+    teacher_cache = {} if teacher_cache_out else None
+    n_with_kl  = 0
+    processed  = 0
+    miss_acc   = 0.0
+    miss_n     = 0
+
+    for it in pending:
+        orig_idx = it["orig_idx"]
+        t_rec    = t_records.get(str(orig_idx))
+        s_rec    = s_records.get(str(orig_idx))
+        if t_rec is None or s_rec is None:
+            n_skipped += 1
+            rec_out = dict(it["rec"])
+            rec_out["merged_paragraphs"] = []
+            rec_out["skipped"]           = True
+            rec_out["skip_reason"]       = "missing_vllm_logprobs"
+            rec_out["_orig_idx"]         = orig_idx
             kl_records.append(rec_out)
-            n_with_kl += 1
-            processed += 1
+            continue
 
-            if processed == 1 or processed % 25 == 0:
-                merged = rec_out["merged_paragraphs"]
-                resp_len = rec_out["resp_len"]
-                n_para = len(merged)
-                mu_mix = (sum(p["normKL"] for p in merged) / n_para) if n_para else 0.0
-                print(f"  [shard {shard_idx + 1}/{n_shards} | "
-                      f"{processed:4d}/{len(pending)}]  "
-                      f"resp_len={resp_len:4d}  paras={n_para:2d}  "
-                      f"mean_normKL_mix={mu_mix:.4f}", flush=True)
+        rec_out = _kl_post_vllm_record(
+            it, t_rec, s_rec, topk, beta, student_tok, teacher_cache,
+        )
+        kl_records.append(rec_out)
+        n_with_kl += 1
+        processed += 1
+        miss_acc += float(rec_out.get("_kl_miss_rate", 0.0))
+        miss_n   += 1
 
-        del s_logits_b, t_logits_b, batch_tensor
-        torch.cuda.empty_cache()
+        if processed == 1 or processed % 50 == 0:
+            merged   = rec_out["merged_paragraphs"]
+            resp_len = rec_out["resp_len"]
+            n_para   = len(merged)
+            mu_mix   = ((sum(p["normKL"] for p in merged) / n_para)
+                        if n_para else 0.0)
+            print(f"  [shard {shard_idx + 1}/{n_shards} | "
+                  f"{processed:4d}/{len(pending)}]  "
+                  f"resp_len={resp_len:4d}  paras={n_para:2d}  "
+                  f"mean_normKL_mix={mu_mix:.4f}  "
+                  f"miss_rate={rec_out.get('_kl_miss_rate', 0.0):.3f}",
+                  flush=True)
 
-    cache_vocab_clip = cache_vocab_clip_ref[0]
-
-    del s_model, t_model
-    gc.collect()
-    torch.cuda.empty_cache()
+    avg_miss = (miss_acc / miss_n) if miss_n else 0.0
+    print(f"  [KL worker {shard_idx + 1}/{n_shards}] mean miss_rate "
+          f"(teacher top-{teacher_K} not covered by student top-{student_K}) "
+          f"= {avg_miss:.4f}", flush=True)
 
     write_jsonl(kl_jsonl_out, kl_records)
 
-    # Save teacher top-K cache (raw logits + indices) for the training step.
     n_cached = 0
     if teacher_cache is not None and teacher_cache_out:
         torch.save({
-            "schema_version": 1,
-            "kl_topk":         int(topk),
-            "vocab_clip":      int(cache_vocab_clip) if cache_vocab_clip else -1,
-            "records":         teacher_cache,
+            "schema_version":    2,
+            "kl_topk":           int(topk),
+            "vocab_clip":        -1,
+            "records":           teacher_cache,
+            "logprobs_in_cache": True,
         }, teacher_cache_out)
         n_cached = len(teacher_cache)
         print(f"  [KL worker {shard_idx + 1}/{n_shards}] teacher topk cache: "
               f"{n_cached} records → {teacher_cache_out}", flush=True)
+
+    # Cleanup scratch files.
+    for p in (pending_pt, s_cfg_path, t_cfg_path, s_out_path, t_out_path):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
 
     with open(out_path, "w") as f:
         json.dump({
@@ -2004,8 +2176,11 @@ def _train_worker(cfg_path):
                 # the cache key mismatches). Without teacher topk we can't
                 # compute the KL loss → drop the example.
                 return None
-            t_idx = tk["topk_indices"]                 # [resp_len_cache, K] int32
-            t_lgt = tk["topk_logits"]                  # [resp_len_cache, K] bfloat16
+            t_idx = tk["topk_indices"]                 # [resp_len_cache, K] int32 vocab idx
+            # NOTE: field name is historical — in vLLM cache mode (schema v2)
+            # this tensor stores top-K logprobs, not raw logits. The OPD KL
+            # math (log_softmax over the K-subset) is identical either way.
+            t_lgt = tk["topk_logits"]                  # [resp_len_cache, K] bfloat16 (logprobs)
             resp_len_cache = int(tk.get("resp_len", t_idx.shape[0]))
             if resp_len_cache != len(response_ids):
                 # Sanity: cache must align 1:1 with response_token_ids.
@@ -2044,8 +2219,9 @@ def _train_worker(cfg_path):
                 "weights":   weights,
                 "prompt_len": int(len(prompt_ids)),
                 "resp_len":   int(len(response_ids)),
-                "teacher_topk_indices": t_idx,    # tensor [resp_len, K]
-                "teacher_topk_logits":  t_lgt,    # tensor [resp_len, K] bf16
+                "teacher_topk_indices": t_idx,    # tensor [resp_len, K] vocab idx
+                "teacher_topk_logits":  t_lgt,    # tensor [resp_len, K] bf16 logprobs
+                                                  # (legacy field name; see cache note above)
             }
 
         def __len__(self):
@@ -2103,19 +2279,29 @@ def _train_worker(cfg_path):
     class OPDConsistencyTrainer(Trainer):
         """OPD loss with top-K teacher support (CACHED) and per-token weights.
 
-        Teacher forward is performed ONCE per epoch during Step 4 and cached.
-        At training time we never load the teacher: each batch carries
+        Teacher forward is performed ONCE per epoch during Step 4 (vLLM
+        prompt_logprobs scoring) and cached to disk. At training time we
+        never load the teacher: each batch carries
             teacher_topk_indices  [B, T-1, K]  : vocab indices on teacher support
-            teacher_topk_logits   [B, T-1, K]  : RAW teacher logits at those indices
+            teacher_topk_logits   [B, T-1, K]  : teacher top-K logprobs at those
+                                                 indices (field name is legacy;
+                                                 vLLM cache stores logprobs —
+                                                 see _epoch_kl_worker docstring)
         aligned with the shifted prediction positions.
 
         For an active (label != -100) position with student logits s_t ∈ R^V:
-            S_t  = teacher_topk_indices[t]          (K indices)
-            s_t' = s_t[S_t] / T                      (gather + temp)
-            t_t' = teacher_topk_logits[t] / T        (RAW from cache, scaled)
+            S_t  = teacher_topk_indices[t]              (K vocab indices)
+            s_t' = s_t[S_t] / T                          (gather + temp scale)
+            t_t' = teacher_topk_logits[t] / T            (cached logprobs / T)
             ŝ_t  = softmax(s_t')
             t̂_t  = softmax(t_t')
             L    = β·KL(ŝ‖t̂) + (1−β)·KL(t̂‖ŝ), weighted by w_t.
+
+        Math note: ``log_softmax(logprobs / T) ≡ log_softmax(logits / T)``
+        on the K-subset because the global ``logsumexp`` shift cancels in
+        softmax, so the loss is unchanged whether the cache stores raw
+        teacher logits (schema v1, legacy HF path) or vLLM logprobs
+        (schema v2, current).
         """
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -2130,7 +2316,12 @@ def _train_worker(cfg_path):
             Args:
                 s_logits_flat:  [N, V]  student logits at active positions
                 t_idx_flat:     [N, K]  teacher top-K vocab indices
-                t_lgt_flat:     [N, K]  teacher top-K RAW logits (will be /T'd)
+                t_lgt_flat:     [N, K]  teacher top-K teacher score values at
+                                        those indices (will be /T'd before
+                                        log_softmax). In schema v2 (vLLM)
+                                        these are logprobs; in legacy v1 they
+                                        were raw logits — both yield the same
+                                        log_softmax over the K-subset.
                 wts_flat:       [N]     per-position weights
                 w_sum:          scalar  sum of weights, clamped >= 1
             """
@@ -2194,9 +2385,11 @@ def _train_worker(cfg_path):
             t_lgt_flat  = t_lgt_full[mask]                # [N_act, K]
             w_sum       = wts_flat.sum().clamp_min(1.0)
 
-            # Vocab safety: clamp teacher indices to student's vocab. Cache
-            # already clipped to min(Vs_step4, Vt) so this is normally a
-            # no-op, but guards against mismatched checkpoints.
+            # Vocab safety: clamp teacher indices to student's vocab. The
+            # vLLM cache (schema v2) does not pre-clip vocab — vocab_clip is
+            # -1 — because student & teacher share the same tokenizer in
+            # standard configs. This guard only fires on mismatched
+            # tokenizers / checkpoints.
             Vs = logits_flat.size(-1)
             if t_idx_flat.max().item() >= Vs:
                 t_idx_flat = t_idx_flat.clamp_max(Vs - 1)
@@ -2633,24 +2826,30 @@ def run_epoch(epoch_idx, current_ckpt, pool):
         # Merge teacher top-K cache shards into one .pt with a flat
         # {orig_idx_str: {...}} record dict. Each shard contributes a
         # disjoint subset of indices (modulo sharding), so a plain dict
-        # update is safe.
+        # update is safe. The merged cache is schema v2 (vLLM logprobs);
+        # see `_kl_post_vllm_record` and `OPDConsistencyTrainer` for the
+        # field semantics.
         merged_cache = {}
-        cache_topk    = KL_TOPK
-        cache_vclip   = -1
+        cache_topk   = KL_TOPK
+        cache_vclip  = -1
+        logprobs_in_cache = False
         for shard_cache in shard_caches:
             if not shard_cache.exists():
                 continue
             blob = torch.load(shard_cache, map_location="cpu")
             merged_cache.update(blob.get("records", {}))
-            cache_topk  = int(blob.get("kl_topk", cache_topk))
-            shard_vclip = int(blob.get("vocab_clip", -1))
+            cache_topk        = int(blob.get("kl_topk", cache_topk))
+            shard_vclip       = int(blob.get("vocab_clip", -1))
             if shard_vclip > 0:
                 cache_vclip = shard_vclip
+            logprobs_in_cache = bool(blob.get("logprobs_in_cache",
+                                              logprobs_in_cache))
         torch.save({
-            "schema_version": 1,
-            "kl_topk":         cache_topk,
-            "vocab_clip":      cache_vclip,
-            "records":         merged_cache,
+            "schema_version":    2,
+            "kl_topk":           cache_topk,
+            "vocab_clip":        cache_vclip,
+            "records":           merged_cache,
+            "logprobs_in_cache": logprobs_in_cache,
         }, teacher_cache_pt)
 
         # Best-effort cleanup of shard files (kl + cache).
@@ -2949,9 +3148,11 @@ def main():
     print(f"  KL_TOPK                    = {KL_TOPK}  "
           f"(teacher-defined support set, renormalised)")
     print(f"  KL_GPUS_PER_WORKER         = {KL_GPUS_PER_WORKER}  "
-          f"(KL data-parallel: workers = N_GPUS // KL_GPUS_PER_WORKER)")
-    print(f"  KL_BATCH_SIZE              = {KL_BATCH_SIZE}  "
-          f"(Step 4 HF micro-batch; parallel s+t when GPUs disjoint)")
+          f"(Step 4: cuda:0=student vLLM TP=1; cuda:1..N-1=teacher vLLM TP=N-1)")
+    print(f"  KL_VLLM_STUDENT_LOGPROBS   = {KL_VLLM_STUDENT_LOGPROBS}  "
+          f"(student prompt_logprobs window — covers teacher top-K)")
+    print(f"  KL_VLLM_GPU_UTIL           = {KL_VLLM_GPU_UTIL}  "
+          f"(gpu_memory_utilization for Step 4 vLLM engines)")
     print(f"  student vLLM (Step 1-3, 7) = DP only  "
           f"(workers={N_GPUS}, tp=1 per worker)")
     print(f"  OPD_REVERSE_KL_BETA        = {OPD_REVERSE_KL_BETA}")
@@ -3010,6 +3211,8 @@ if __name__ == "__main__":
         _epoch_student_worker(sys.argv[2], sys.argv[3])
     elif len(sys.argv) >= 4 and sys.argv[1] == "--_kl-worker":
         _epoch_kl_worker(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--_kl-score-worker":
+        _vllm_score_prompts(sys.argv[2])
     elif len(sys.argv) >= 4 and sys.argv[1] == "--_eval-worker":
         _epoch_eval_worker(sys.argv[2], sys.argv[3])
     elif len(sys.argv) >= 3 and sys.argv[1] == "--_train-worker":
