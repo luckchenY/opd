@@ -527,8 +527,18 @@ def _resolve_tensor_parallel_size(model_path, requested_tp):
     return 1
 
 
-def make_llm(model_path, gpu_util=0.85, max_model_len=None, apc=True):
-    tp = _resolve_tensor_parallel_size(model_path, N_GPUS)
+def make_llm(model_path, gpu_util=0.85, max_model_len=None, apc=True,
+           tensor_parallel_size=None):
+    """Build a vLLM engine.
+
+    tensor_parallel_size:
+        If set, use this TP size (e.g. pass 1 for data-parallel workers that
+        each own a single GPU). If None, auto-pick from visible GPU count.
+    """
+    if tensor_parallel_size is not None:
+        tp = max(1, int(tensor_parallel_size))
+    else:
+        tp = _resolve_tensor_parallel_size(model_path, N_GPUS)
     if max_model_len is None:
         max_model_len = EPOCH_MAX_MODEL_LEN
     # Disable cudagraph + torch.compile path: vLLM v0.18 V1 engine + GQA
