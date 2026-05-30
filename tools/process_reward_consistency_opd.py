@@ -140,14 +140,21 @@ Important env vars
                               device_map="auto" and the student is replicated
                               on cuda:0. Workers (data-parallel) =
                               N_GPUS // KL_GPUS_PER_WORKER. Default 2.
-  KL_MEM_FRACTION             Fraction of each GPU's *free* memory the teacher
-                              device_map may use for weights; the rest is
-                              runtime headroom for forward logits + per-chunk
-                              fp32 KL buffers. Size-agnostic (works on 40GB /
-                              80GB). Clamped to [0.5, 0.97]. Default 0.85.
+  KL_MEM_FRACTION             Fraction of *free* memory on cuda:1+ (within each
+                              worker's CUDA_VISIBLE_DEVICES slice) for teacher
+                              weights. Default 0.85.
+  KL_MEM_FRACTION_CUDA0       Same, but for the worker-local cuda:0 only (the
+                              first GPU in that slice after remapping). Student
+                              is replicated here and KL logits aggregate here,
+                              so this defaults lower. Default 0.68.
+                              Both are clamped to [0.5, 0.97].
   KL_FWD_CHUNK                Response positions processed per fp32 KL block.
                               Bounds the runtime peak to O(chunk × vocab),
-                              independent of response length. Default 512.
+                              independent of response length. Default 128.
+  KL_ON_CPU                   If 1, run chunked KL on CPU (slower, saves GPU
+                              headroom). Default 0 (KL on worker-local cuda:0).
+  KL_SCORE_BATCH              Rollouts per batched HF forward (left-padded).
+                              Default 2; set 1 if forward OOMs.
   KL_ATTN_IMPL                Attention kernel for the Step-4 HF forward.
                               Default: flash_attention_2 if importable, else
                               sdpa.
@@ -1282,6 +1289,71 @@ def _kl_prepare_or_skip(rec, orig_idx, student_tok):
     }, None
 
 
+def _kl_pad_id(tok):
+    if tok.pad_token_id is not None:
+        return tok.pad_token_id
+    if tok.eos_token_id is not None:
+        return tok.eos_token_id
+    return 0
+
+
+def _kl_build_padded_batch(batch_items, pad_id):
+    """Left-pad variable-length sequences to [B, max_len] for one HF forward."""
+    max_len = max(it["seq_len"] for it in batch_items)
+    bsz = len(batch_items)
+    input_ids = torch.full((bsz, max_len), pad_id, dtype=torch.long)
+    offsets = []
+    for i, it in enumerate(batch_items):
+        seq_len = it["seq_len"]
+        off = max_len - seq_len
+        input_ids[i, off:] = torch.tensor(it["full_ids_list"], dtype=torch.long)
+        offsets.append(off)
+    attention_mask = (input_ids != pad_id).long()
+    return input_ids, attention_mask, offsets
+
+
+def _kl_chunked_full_vocab_kl(s_resp, t_resp, temp, kl_chunk, topk):
+    """Full-vocab per-token KL + teacher top-K cache rows (on s_resp's device)."""
+    import torch.nn.functional as F
+
+    resp_len = s_resp.size(0)
+    vocab = s_resp.size(-1)
+    kk = min(topk, vocab)
+    kl_device = s_resp.device
+    kl_fwd_list = [0.0] * resp_len
+    kl_rev_list = [0.0] * resp_len
+    cache_idx_rows = torch.zeros((resp_len, topk), dtype=torch.int32)
+    cache_lgt_rows = torch.zeros((resp_len, topk), dtype=torch.bfloat16)
+
+    chunk_eff = kl_chunk
+    if kl_device.type == "cuda":
+        free_b, _ = torch.cuda.mem_get_info(kl_device.index or 0)
+        row_bytes = max(vocab, 1) * 4 * 4
+        chunk_eff = max(1, min(kl_chunk, int((free_b * 0.15) // row_bytes)))
+
+    for st in range(0, resp_len, chunk_eff):
+        ed = min(st + chunk_eff, resp_len)
+        t_bl = t_resp[st:ed].float()
+        s_bl = s_resp[st:ed].float()
+        t_log = F.log_softmax(t_bl / temp, dim=-1)
+        s_log = F.log_softmax(s_bl / temp, dim=-1)
+        kl_fwd = F.kl_div(s_log, t_log, log_target=True,
+                          reduction="none").sum(-1)
+        kl_rev = F.kl_div(t_log, s_log, log_target=True,
+                          reduction="none").sum(-1)
+        kl_fwd_cpu = kl_fwd.clamp_min(0.0).tolist()
+        kl_rev_cpu = kl_rev.clamp_min(0.0).tolist()
+        for j in range(ed - st):
+            kl_fwd_list[st + j] = float(kl_fwd_cpu[j])
+            kl_rev_list[st + j] = float(kl_rev_cpu[j])
+        tk = torch.topk(t_bl, k=kk, dim=-1)
+        cache_idx_rows[st:ed, :kk] = tk.indices.to(torch.int32).cpu()
+        cache_lgt_rows[st:ed, :kk] = tk.values.to(torch.bfloat16).cpu()
+        del t_bl, s_bl, t_log, s_log, kl_fwd, kl_rev
+
+    return kl_fwd_list, kl_rev_list, cache_idx_rows, cache_lgt_rows
+
+
 def _kl_record_from_token_kls(
     item, kl_fwd_list, kl_rev_list, cache_idx_rows, cache_lgt_rows,
     topk, beta, student_tok, teacher_cache,
@@ -1393,7 +1465,6 @@ def _epoch_kl_worker(cfg_path, out_path):
       • response: use ``response_token_ids`` directly from the rollout
         (EXACT, on-policy).
     """
-    import torch.nn.functional as F
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
     with open(cfg_path) as f:
@@ -1461,12 +1532,10 @@ def _epoch_kl_worker(cfg_path, out_path):
     #   1. Load the small student on cuda:0 FIRST, so it claims its footprint
     #      before we measure free memory.
     #   2. Size the teacher device_map budget from each GPU's *actual free
-    #      bytes* (torch.cuda.mem_get_info) × KL_MEM_FRACTION — NOT from total
-    #      memory and NOT a fixed GiB reserve. Using free bytes is
-    #      size-agnostic (scales to any card) and automatically subtracts the
-    #      student already sitting on cuda:0. The (1 - fraction) slack left on
-    #      EVERY device is the runtime headroom for the forward logits and the
-    #      per-chunk fp32 KL buffers.
+    #      bytes* × KL_MEM_FRACTION_CUDA0 on worker-local cuda:0 (student +
+    #      KL aggregation) and KL_MEM_FRACTION on cuda:1+ — NOT from total
+    #      memory. Using free bytes is size-agnostic and subtracts the student
+    #      already on cuda:0. Response logits are kept on CPU after forward.
     # Note device_map="auto" only bounds *weight placement*; the headroom
     # above + the chunked bf16→fp32 KL math below (peak O(KL_FWD_CHUNK × V),
     # independent of resp_len) are what actually keep the forward from OOMing.
@@ -1499,24 +1568,30 @@ def _epoch_kl_worker(cfg_path, out_path):
     student.eval()
 
     # Teacher budget from real free memory per device × fraction. mem_get_info
-    # returns device-global (free, total); each KL worker owns a disjoint GPU
-    # slice (CUDA_VISIBLE_DEVICES), so no other worker contends for these.
-    mem_fraction = min(max(float(os.environ.get("KL_MEM_FRACTION", "0.85")),
-                           0.5), 0.97)
+    # is per worker-local index: cuda:0 is the *first GPU in this worker's
+    # CUDA_VISIBLE_DEVICES slice* (not necessarily physical GPU 0). Student
+    # lives on cuda:0; give teacher a smaller cap there and more on cuda:1+.
+    def _kl_mem_frac(key: str, default: float) -> float:
+        return min(max(float(os.environ.get(key, str(default))), 0.3), 0.97)
+
+    frac_cuda0 = _kl_mem_frac("KL_MEM_FRACTION_CUDA0", 0.3)
+    frac_other = _kl_mem_frac("KL_MEM_FRACTION", 0.85)
     torch.cuda.synchronize()
     max_memory  = {}
     budget_desc = []
     for i in range(n_vis):
+        frac = frac_cuda0 if i == 0 else frac_other
         free_b, total_b = torch.cuda.mem_get_info(i)
-        cap_mib = int((free_b * mem_fraction) // (1024 ** 2))
+        cap_mib = int((free_b * frac) // (1024 ** 2))
         max_memory[i] = f"{max(512, cap_mib)}MiB"
         budget_desc.append(
-            f"cuda:{i} free={free_b / 1024 ** 3:.1f}/"
+            f"cuda:{i} frac={frac:.2f} free={free_b / 1024 ** 3:.1f}/"
             f"{total_b / 1024 ** 3:.1f}GiB→cap={cap_mib / 1024:.1f}GiB")
 
     print(f"  [KL worker {shard_idx + 1}/{n_shards}] loading teacher "
           f"({os.path.basename(teacher_path)}) sharded over {n_vis} GPU(s) "
-          f"device_map=auto  frac={mem_fraction}  attn={attn_impl}\n"
+          f"device_map=auto  frac_cuda0={frac_cuda0}  frac_other={frac_other}  "
+          f"attn={attn_impl}\n"
           f"      budget: {'  |  '.join(budget_desc)}", flush=True)
     teacher = AutoModelForCausalLM.from_pretrained(
         teacher_path,
@@ -1531,91 +1606,89 @@ def _epoch_kl_worker(cfg_path, out_path):
     teacher.eval()
     teacher_in_device = teacher.get_input_embeddings().weight.device
 
-    kl_chunk = max(1, int(os.environ.get("KL_FWD_CHUNK", "512")))
+    kl_chunk     = max(1, int(os.environ.get("KL_FWD_CHUNK", "128")))
+    kl_on_cpu    = os.environ.get("KL_ON_CPU", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+    score_batch  = max(1, int(os.environ.get("KL_SCORE_BATCH", "2")))
+    pad_id       = _kl_pad_id(student_tok)
+    kl_store     = "cpu" if kl_on_cpu else student_device
+
+    print(f"  [KL worker {shard_idx + 1}/{n_shards}] scoring: "
+          f"batch={score_batch}  kl_device={kl_store}  kl_chunk={kl_chunk}",
+          flush=True)
 
     teacher_cache = {} if teacher_cache_out else None
     n_with_kl  = 0
     processed  = 0
     sum_normkl = 0.0
 
-    for it in pending:
-        orig_idx   = it["orig_idx"]
-        full_ids   = it["full_ids_list"]
-        prompt_len = it["prompt_len"]
-        resp_len   = it["resp_len"]
+    for batch_start in range(0, len(pending), score_batch):
+        batch_items = pending[batch_start: batch_start + score_batch]
+        if len(batch_items) == 1:
+            input_ids = torch.tensor(
+                [batch_items[0]["full_ids_list"]], dtype=torch.long)
+            attention_mask = None
+            offsets = [0]
+        else:
+            input_ids, attention_mask, offsets = _kl_build_padded_batch(
+                batch_items, pad_id)
 
-        input_ids = torch.tensor([full_ids], dtype=torch.long)
+        fwd_kw_s = {"input_ids": input_ids.to(student_device)}
+        fwd_kw_t = {"input_ids": input_ids.to(teacher_in_device)}
+        if attention_mask is not None:
+            am_s = attention_mask.to(student_device)
+            fwd_kw_s["attention_mask"] = am_s
+            fwd_kw_t["attention_mask"] = attention_mask.to(teacher_in_device)
 
         with torch.no_grad():
-            s_logits = student(
-                input_ids=input_ids.to(student_device)
-            ).logits[0]                                # [seq, Vs]
-            t_logits = teacher(
-                input_ids=input_ids.to(teacher_in_device)
-            ).logits[0]                                # [seq, Vt]
+            s_logits_b = student(**fwd_kw_s).logits          # [B, seq, Vs]
+            t_logits_b = teacher(**fwd_kw_t).logits          # [B, seq, Vt]
 
-        # The distribution that predicts response token at absolute position
-        # p lives at logits[p-1]; response tokens occupy [prompt_len, seq),
-        # so their predicting rows are [prompt_len-1, prompt_len-1+resp_len).
-        lo, hi = prompt_len - 1, prompt_len - 1 + resp_len
-        V = min(s_logits.size(-1), t_logits.size(-1))
-        # Keep the per-response logits in bf16 on cuda:0; fp32 is materialised
-        # only per chunk below, so the runtime peak is O(KL_FWD_CHUNK × V) and
-        # does NOT grow with response length.
-        s_resp = s_logits[lo:hi, :V].to(student_device)   # [resp_len, V] bf16
-        t_resp = t_logits[lo:hi, :V].to(student_device)   # [resp_len, V] bf16
-        del s_logits, t_logits
+        for bi, it in enumerate(batch_items):
+            off = offsets[bi]
+            lo = off + it["prompt_len"] - 1
+            hi = lo + it["resp_len"]
+            s_row = s_logits_b[bi]
+            t_row = t_logits_b[bi]
+            vocab = min(s_row.size(-1), t_row.size(-1))
+            if kl_on_cpu:
+                s_resp = s_row[lo:hi, :vocab].cpu()
+                t_resp = t_row[lo:hi, :vocab].cpu()
+            else:
+                s_resp = s_row[lo:hi, :vocab]
+                t_resp = t_row[lo:hi, :vocab].to(student_device)
 
-        kl_fwd_list = [0.0] * resp_len
-        kl_rev_list = [0.0] * resp_len
-        kk          = min(topk, V)
-        cache_idx_rows = torch.zeros((resp_len, topk), dtype=torch.int32)
-        cache_lgt_rows = torch.zeros((resp_len, topk), dtype=torch.bfloat16)
+            kl_fwd_list, kl_rev_list, cache_idx_rows, cache_lgt_rows = (
+                _kl_chunked_full_vocab_kl(
+                    s_resp, t_resp, temp, kl_chunk, topk))
+            del s_resp, t_resp
 
-        for st in range(0, resp_len, kl_chunk):
-            ed   = min(st + kl_chunk, resp_len)
-            t_bl = t_resp[st:ed].float()                 # [chunk, V] fp32
-            s_bl = s_resp[st:ed].float()                 # [chunk, V] fp32
-            t_log = F.log_softmax(t_bl / temp, dim=-1)
-            s_log = F.log_softmax(s_bl / temp, dim=-1)
-            t_p   = t_log.exp()
-            s_p   = s_log.exp()
-            kl_fwd = (t_p * (t_log - s_log)).sum(-1)   # KL(teacher ‖ student)
-            kl_rev = (s_p * (s_log - t_log)).sum(-1)   # KL(student ‖ teacher)
-            kl_fwd_cpu = kl_fwd.clamp_min(0.0).tolist()
-            kl_rev_cpu = kl_rev.clamp_min(0.0).tolist()
-            for j in range(ed - st):
-                kl_fwd_list[st + j] = float(kl_fwd_cpu[j])
-                kl_rev_list[st + j] = float(kl_rev_cpu[j])
+            rec_out = _kl_record_from_token_kls(
+                it, kl_fwd_list, kl_rev_list, cache_idx_rows, cache_lgt_rows,
+                topk, beta, student_tok, teacher_cache,
+            )
+            kl_records.append(rec_out)
+            n_with_kl += 1
+            processed += 1
 
-            # Teacher top-K (raw logits) over the common vocab for the cache.
-            tk = torch.topk(t_bl, k=kk, dim=-1)
-            cache_idx_rows[st:ed, :kk] = tk.indices.to(torch.int32).cpu()
-            cache_lgt_rows[st:ed, :kk] = tk.values.to(torch.bfloat16).cpu()
-            del t_bl, s_bl, t_log, s_log, t_p, s_p
+            merged = rec_out["merged_paragraphs"]
+            if merged:
+                sum_normkl += sum(p["normKL"] for p in merged) / len(merged)
 
-        del s_resp, t_resp
+            if processed == 1 or processed % 50 == 0:
+                n_para = len(merged)
+                mu_mix = ((sum(p["normKL"] for p in merged) / n_para)
+                          if n_para else 0.0)
+                print(f"  [shard {shard_idx + 1}/{n_shards} | "
+                      f"{processed:4d}/{len(pending)}]  "
+                      f"resp_len={rec_out['resp_len']:4d}  paras={n_para:2d}  "
+                      f"mean_normKL_mix={mu_mix:.4f}", flush=True)
 
-        rec_out = _kl_record_from_token_kls(
-            it, kl_fwd_list, kl_rev_list, cache_idx_rows, cache_lgt_rows,
-            topk, beta, student_tok, teacher_cache,
-        )
-        kl_records.append(rec_out)
-        n_with_kl += 1
-        processed += 1
-
-        merged = rec_out["merged_paragraphs"]
-        if merged:
-            sum_normkl += sum(p["normKL"] for p in merged) / len(merged)
-
-        if processed == 1 or processed % 50 == 0:
-            n_para = len(merged)
-            mu_mix = ((sum(p["normKL"] for p in merged) / n_para)
-                      if n_para else 0.0)
-            print(f"  [shard {shard_idx + 1}/{n_shards} | "
-                  f"{processed:4d}/{len(pending)}]  "
-                  f"resp_len={rec_out['resp_len']:4d}  paras={n_para:2d}  "
-                  f"mean_normKL_mix={mu_mix:.4f}", flush=True)
+        del s_logits_b, t_logits_b, input_ids
+        if attention_mask is not None:
+            del attention_mask
+        if not kl_on_cpu:
+            torch.cuda.empty_cache()
 
     write_jsonl(kl_jsonl_out, kl_records)
 

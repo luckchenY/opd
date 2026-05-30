@@ -1,1 +1,0 @@
-{"current_ckpt": "Qwen/Qwen3-1.7B", "workset_jsonl": "/lambda/nfs/chenyang/opd/tools/consistency_opd_output/epoch_000_workset.jsonl", "rollouts_jsonl_out": "/lambda/nfs/chenyang/opd/tools/consistency_opd_output/epoch_000_rollouts.shard0.jsonl", "shard_idx": 0, "n_shards": 1}
