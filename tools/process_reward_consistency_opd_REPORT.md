@@ -635,3 +635,47 @@ python tools/process_reward_consistency_opd.py
 ---
 
 *文档生成日期：2026-05-27*
+
+
+
+
+文章https://arxiv.org/pdf/2605.03677中针对KL散度打分和结果的一致性，来校验这个KL打分是否合理。在这个基础上，我们分析了KL散度打分在一个回答中不同段落中的一致性问题。student 在 rollout 过程中，某些推理段落虽然获得了较高的 Process Reward（PR），但与 teacher 的分布一致性（KL）反而更差。如果直接对所有 token 做 KL 蒸馏，可能会引入错误的监督信号，影响训练质量。
+
+针对这个问题，我设计了一套基于 PR–KL 序关系的一致性筛选机制，核心思路是：
+
+不把 PR 当作回归目标，而是作为判断 KL 是否可靠的“序探针”；
+
+在同一 response 内，要求 PR 高的段落，其 KL 应更低（与 teacher 更一致）；
+
+对违反这一关系的段落，在 OPD loss 中将其 token 权重置零（mask），避免污染训练；
+同时，对整体不可靠的 response 进行重试或丢弃，逐步构建高质量训练集。
+
+pr的计算方式为：#### Step 1: Student rollout
+- prompt: `build_filter_prompt(problem, tokenizer)` → `[sys: EPISODE_EVAL_SYSTEM][user: problem]` + `add_generation_prompt`
+- 采样: temperature=ROLLOUT_TEMPERATURE, top_k=50, n=1, max_tokens=MAX_NEW_TOKENS
+- 通过 `safe_generate`（带 prompt 长度过滤、失败兜底）
+
+#### Step 2: 段落切分（CPU）
+`segment_response_text(response)`：
+- 在 trigger word（如 "wait", "let me check", "actually"...）处切，且当前段累计句号数 ≥ `SEGMENT_MIN_PERIODS` 才切
+- 返回 `[(start_char, end_char), ...]`，episode i 的前缀 = `response[:end_char]`
+
+#### Step 3: K-fold PR 评估
+对每条 student response，构建一组 forced-answer prompt：
+- **Empty-prefix baseline**: `build_episode_eval_prompt(problem, "", tok)` → 学生不思考、直接强制出 boxed 答案的命中率
+- **每个 episode 边界**: `build_episode_eval_prompt(problem, response[:end_c], tok)` → 截到第 i 段末尾后强制出答案的命中率
+
+每条 prompt 采样 `K_EVAL` 次（temperature=EVAL_TEMPERATURE, max_tokens=MAX_ANSWER_TOKENS, stop=`<|im_end|>`）。
+每条 prompt 的 acc_rate = K 次中命中 gt 的比例。
+
+`build_episode_eval_prompt` 关键细节：如果 prefix 在 `<think>` 块内，先补 `</think>` 再加 `EPISODE_EVAL_SUFFIX`（强制收敛到 boxed 答案）。
+
+K-fold 结果存进 `acc_per_li[li] = {-1: empty_acc, 0: acc_0, 1: acc_1, ...}`。
+
+#### Step 4: 计算 PR + 段权重 + 写训练记录
+
+`compute_segments_for_response(episodes, ep_accs, empty_acc, do_merge)`：
+
+1. **原始 PR**: 对每段 i，`pr_i = acc_rate_i - acc_rate_{i-1}`（i=0 时上一段 = `empty_acc`）
+2. **可选 merge**: 若 `MERGE_SEGMENTS=true`，调 `merge_monotonic_runs` 折叠 PR 单调 run（连续上升或连续下降 → 合并为最末端那个点）
+3. **重算 PR**（合并后）: 用「相对 empty_acc 的累积变化」重算，即 `pr_merged_i = acc_merged_i - acc_merged_{i-1}`

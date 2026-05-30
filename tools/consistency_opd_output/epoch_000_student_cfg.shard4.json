@@ -1,0 +1,1 @@
+{"current_ckpt": "Qwen/Qwen3-1.7B", "workset_jsonl": "/home/ubuntu/chenyang/opd/tools/consistency_opd_output/epoch_000_workset.jsonl", "rollouts_jsonl_out": "/home/ubuntu/chenyang/opd/tools/consistency_opd_output/epoch_000_rollouts.shard4.jsonl", "student_cache_pt_out": "/dev/shm/opd_epoch_000_student_topk_cache.shard4.pt", "shard_idx": 4, "n_shards": 8}

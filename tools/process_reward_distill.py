@@ -528,12 +528,16 @@ def _resolve_tensor_parallel_size(model_path, requested_tp):
 
 
 def make_llm(model_path, gpu_util=0.85, max_model_len=None, apc=True,
-           tensor_parallel_size=None):
+           tensor_parallel_size=None, max_logprobs=None):
     """Build a vLLM engine.
 
     tensor_parallel_size:
         If set, use this TP size (e.g. pass 1 for data-parallel workers that
         each own a single GPU). If None, auto-pick from visible GPU count.
+    max_logprobs:
+        If set, override vLLM's default cap on the number of logprobs that can
+        be requested per token (vLLM v1 defaults to 20). Must be >= the
+        logprobs value used in SamplingParams.
     """
     if tensor_parallel_size is not None:
         tp = max(1, int(tensor_parallel_size))
@@ -548,7 +552,7 @@ def make_llm(model_path, gpu_util=0.85, max_model_len=None, apc=True,
     enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "1") != "0"
     print(f"  [vLLM] init  model={os.path.basename(model_path)}  "
           f"tp={tp}  apc={apc}  enforce_eager={enforce_eager}", flush=True)
-    return LLM(
+    llm_kwargs = dict(
         model=model_path,
         tensor_parallel_size=tp,
         dtype="bfloat16",
@@ -558,6 +562,9 @@ def make_llm(model_path, gpu_util=0.85, max_model_len=None, apc=True,
         enable_prefix_caching=apc,
         enforce_eager=enforce_eager,
     )
+    if max_logprobs is not None:
+        llm_kwargs["max_logprobs"] = max_logprobs
+    return LLM(**llm_kwargs)
 
 
 def destroy_llm(llm):
