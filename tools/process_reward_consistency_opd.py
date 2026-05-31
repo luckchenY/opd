@@ -296,8 +296,9 @@ if not (0.0 <= OPD_REVERSE_KL_BETA <= 1.0):
 # Number of GPUs each Step-4 KL worker owns (its CUDA_VISIBLE_DEVICES slice).
 # Step 4 now runs a forward-only HF pass (NOT vLLM): inside each worker the
 # teacher is sharded across the slice via device_map="auto" (layer-split model
-# parallelism) and the student (small) is replicated on cuda:0. Full-vocab KL
-# is computed on-GPU under no_grad. Data parallelism comes from launching
+# parallelism) and the student (small) is replicated on cuda:0. Teacher
+# top-K-support KL is computed on-GPU under no_grad. Data parallelism comes
+# from launching
 # ``N_GPUS // KL_GPUS_PER_WORKER`` such workers, each on a disjoint GPU slice.
 # For a 32B teacher on 40GB cards, 2 GPUs per worker fit the sharded weights
 # (~32GB/GPU) plus the student and activations.
@@ -329,7 +330,7 @@ KL_VLLM_GPU_UTIL = float(os.environ.get("KL_VLLM_GPU_UTIL", "0.80"))
 # ─── Training knobs ──────────────────────────────────────────────────────────
 N_EPOCHS        = int(os.environ.get("N_EPOCHS", "5"))
 GKD_LR          = float(os.environ.get("GKD_LR", "1e-6"))
-GKD_BATCH_SIZE  = int(os.environ.get("GKD_BATCH_SIZE", "16"))
+GKD_BATCH_SIZE  = int(os.environ.get("GKD_BATCH_SIZE", "1"))
 GKD_GRAD_ACCUM  = int(os.environ.get("GKD_GRAD_ACCUM", "4"))
 GKD_MAX_LEN     = int(os.environ.get("GKD_MAX_LEN", str(MAX_NEW_TOKENS + 1024)))
 GKD_WARMUP      = float(os.environ.get("GKD_WARMUP", "0.05"))
@@ -1312,8 +1313,35 @@ def _kl_build_padded_batch(batch_items, pad_id):
     return input_ids, attention_mask, offsets
 
 
-def _kl_chunked_full_vocab_kl(s_resp, t_resp, temp, kl_chunk, topk):
-    """Full-vocab per-token KL + teacher top-K cache rows (on s_resp's device)."""
+def _kl_chunked_topk_kl(s_resp, t_resp, temp, kl_chunk, topk):
+    """Per-token KL on the teacher's TOP-K support set + top-K cache rows.
+
+    Implements the OPD top-K objective (see module docstring and the two
+    reference derivations). For each response position c_t we take the
+    teacher's top-K support
+
+        S_t = TopK_q(c_t),
+
+    gather BOTH the teacher and the student logits at those K vocab indices,
+    and ``log_softmax`` each ONLY over the K-subset, i.e. we renormalise both
+    distributions over S_t:
+
+        pi_hat(v) = softmax_{u in S_t}( s_logit_u / T )[v]   (student)
+        q_hat(v)  = softmax_{u in S_t}( t_logit_u / T )[v]   (teacher)
+
+    and then form the truncated per-token KLs
+
+        kl_fwd[t] = KL( q_hat  || pi_hat )   (forward, teacher || student)
+        kl_rev[t] = KL( pi_hat || q_hat  )   (reverse, student || teacher).
+
+    This replaces the previous full-vocabulary KL: it compares the two
+    distributions only on the teacher-supported local region S_t, is far
+    cheaper than a full-vocab softmax, and matches the training-time loss
+    in ``OPDTrainer._topk_kl_cached`` (which renormalises over the same
+    cached S_t). The cache rows store the teacher's top-K vocab indices and
+    the *raw* teacher logits at those indices; Step 6 re-applies
+    ``log_softmax(cache / T)`` over the K-subset.
+    """
     import torch.nn.functional as F
 
     resp_len = s_resp.size(0)
@@ -1335,21 +1363,25 @@ def _kl_chunked_full_vocab_kl(s_resp, t_resp, temp, kl_chunk, topk):
         ed = min(st + chunk_eff, resp_len)
         t_bl = t_resp[st:ed].float()
         s_bl = s_resp[st:ed].float()
-        t_log = F.log_softmax(t_bl / temp, dim=-1)
-        s_log = F.log_softmax(s_bl / temp, dim=-1)
+        # S_t = teacher top-K support on this block (TopK_q).
+        tk = torch.topk(t_bl, k=kk, dim=-1)
+        # Gather teacher + student logits on S_t and renormalise over S_t only.
+        t_top = tk.values / temp                          # [b, kk]
+        s_top = s_bl.gather(-1, tk.indices) / temp        # [b, kk]
+        t_log = F.log_softmax(t_top, dim=-1)              # log q_hat  over S_t
+        s_log = F.log_softmax(s_top, dim=-1)              # log pi_hat over S_t
         kl_fwd = F.kl_div(s_log, t_log, log_target=True,
-                          reduction="none").sum(-1)
+                          reduction="none").sum(-1)        # KL(q_hat || pi_hat)
         kl_rev = F.kl_div(t_log, s_log, log_target=True,
-                          reduction="none").sum(-1)
+                          reduction="none").sum(-1)        # KL(pi_hat || q_hat)
         kl_fwd_cpu = kl_fwd.clamp_min(0.0).tolist()
         kl_rev_cpu = kl_rev.clamp_min(0.0).tolist()
         for j in range(ed - st):
             kl_fwd_list[st + j] = float(kl_fwd_cpu[j])
             kl_rev_list[st + j] = float(kl_rev_cpu[j])
-        tk = torch.topk(t_bl, k=kk, dim=-1)
         cache_idx_rows[st:ed, :kk] = tk.indices.to(torch.int32).cpu()
         cache_lgt_rows[st:ed, :kk] = tk.values.to(torch.bfloat16).cpu()
-        del t_bl, s_bl, t_log, s_log, kl_fwd, kl_rev
+        del t_bl, s_bl, t_top, s_top, t_log, s_log, kl_fwd, kl_rev
 
     return kl_fwd_list, kl_rev_list, cache_idx_rows, cache_lgt_rows
 
@@ -1361,10 +1393,12 @@ def _kl_record_from_token_kls(
     """Assemble a kl.jsonl record (+ teacher top-K cache entry) from
     precomputed per-response-token KL values.
 
-    Inputs come from the HF full-vocab forward pass in ``_epoch_kl_worker``:
-      • ``kl_fwd_list[t]`` = KL(teacher ‖ student) at response position t,
-      • ``kl_rev_list[t]`` = KL(student ‖ teacher) at response position t,
-        both over the common vocabulary (NO top-K truncation, NO miss).
+    Inputs come from the HF forward pass in ``_epoch_kl_worker`` reduced on
+    the teacher's top-K support S_t (see ``_kl_chunked_topk_kl``):
+      • ``kl_fwd_list[t]`` = KL(q_hat ‖ pi_hat) at response position t,
+      • ``kl_rev_list[t]`` = KL(pi_hat ‖ q_hat) at response position t,
+        where both distributions are renormalised over S_t = TopK_q(c_t)
+        (NO miss: the student logits are exact at every teacher top-K index).
       • ``cache_idx_rows`` / ``cache_lgt_rows`` are [resp_len, topk] tensors
         holding the teacher's top-K vocab indices and the *raw teacher
         logits* at those indices. Step 6 consumes the cache via
@@ -1435,13 +1469,15 @@ def _kl_record_from_token_kls(
     rec_out["kl_topk"]           = int(topk)
     rec_out["opd_beta_used"]     = float(beta)
     rec_out["_orig_idx"]         = orig_idx
-    # Full-vocab KL has no top-K coverage miss (kept for schema stability).
+    # Student logits are gathered exactly at the teacher's top-K indices, so
+    # there is no top-K coverage miss (kept for schema stability).
     rec_out["_kl_miss_rate"]     = 0.0
     return rec_out
 
 
 def _epoch_kl_worker(cfg_path, out_path):
-    """HF forward-only per-token KL (full-vocab), one GPU slice per worker.
+    """HF forward-only per-token KL on teacher top-K support, one GPU slice
+    per worker.
 
     Parallelism (this worker owns ``CUDA_VISIBLE_DEVICES`` = its slice):
       • teacher (large): sharded across the slice via ``device_map="auto"``
@@ -1453,12 +1489,14 @@ def _epoch_kl_worker(cfg_path, out_path):
     launching ``N_GPUS // KL_GPUS_PER_WORKER`` of these workers on disjoint
     slices, each scoring its modulo-sharded subset of rollouts.
 
-    Per response position we take BOTH models' full next-token logits over
-    the common vocabulary and compute, on-GPU and chunked:
-      • kl_fwd = KL(teacher ‖ student),  kl_rev = KL(student ‖ teacher),
+    Per response position we take the teacher's top-K support S_t = TopK_q,
+    gather BOTH models' logits at those K indices, renormalise each over S_t
+    and compute, on-GPU and chunked:
+      • kl_fwd = KL(q_hat ‖ pi_hat),  kl_rev = KL(pi_hat ‖ q_hat),
     then aggregate to length-weighted ``normKL`` per merged paragraph for
-    the consistency step. We also extract teacher top-K logits to cache for
-    the Step-6 distillation loss (schema-compatible with the trainer).
+    the consistency step. The same teacher top-K logits are cached for the
+    Step-6 distillation loss (schema-compatible with the trainer), so the
+    offline KL and the training loss compare distributions on identical S_t.
 
     Retokenisation:
       • prompt: tokenize(build_filter_prompt(problem)) — matches training
@@ -1497,7 +1535,7 @@ def _epoch_kl_worker(cfg_path, out_path):
 
     print(f"\n[KL worker {shard_idx + 1}/{n_shards}] processing "
           f"{len(rollouts)}/{len(rollouts_all)} rollouts  "
-          f"top-K={topk}  beta={beta}  temp={temp}  mode=HF-full-vocab",
+          f"top-K={topk}  beta={beta}  temp={temp}  mode=HF-teacher-topK",
           flush=True)
 
     # ── Skip resolution / pending prep ─────────────────────────────────
@@ -1659,7 +1697,7 @@ def _epoch_kl_worker(cfg_path, out_path):
                 t_resp = t_row[lo:hi, :vocab].to(student_device)
 
             kl_fwd_list, kl_rev_list, cache_idx_rows, cache_lgt_rows = (
-                _kl_chunked_full_vocab_kl(
+                _kl_chunked_topk_kl(
                     s_resp, t_resp, temp, kl_chunk, topk))
             del s_resp, t_resp
 
@@ -3100,7 +3138,7 @@ def main():
     print(f"  MAX_RETRIES                = {MAX_RETRIES}")
     print(f"  K_EVAL                     = {K_EVAL}")
     print(f"  KL_TOPK                    = {KL_TOPK}  "
-          f"(teacher top-K cached for Step 6; consistency KL is full-vocab)")
+          f"(teacher top-K cached for Step 6; consistency KL on teacher top-K support S_t)")
     print(f"  KL_GPUS_PER_WORKER         = {KL_GPUS_PER_WORKER}  "
           f"(Step 4 HF: teacher device_map-sharded over the slice; "
           f"student replicated on cuda:0; DP across {max(1, N_GPUS // KL_GPUS_PER_WORKER)} workers)")
