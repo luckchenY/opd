@@ -106,7 +106,7 @@ Per-epoch pipeline
                            (f) write epoch_NNN_train.jsonl
   Step 6  torchrun       : OPD training with top-K-support KL and per-token
                            weights (masked tokens contribute zero loss)
-  Step 7  vLLM (student) : post-training held-out + train-eval
+  Step 7  vLLM (student) : post-training test-set eval (test_set.jsonl)
 
 The training KL is
 
@@ -148,9 +148,14 @@ Important env vars
                               is replicated here and KL logits aggregate here,
                               so this defaults lower. Default 0.68.
                               Both are clamped to [0.5, 0.97].
-  KL_FWD_CHUNK                Response positions processed per fp32 KL block.
-                              Bounds the runtime peak to O(chunk × vocab),
-                              independent of response length. Default 128.
+  KL_FWD_CHUNK                Response positions processed per top-K KL block.
+                              Bounds the runtime peak to O(chunk × vocab) for
+                              the topk read (native dtype; the KL math itself
+                              is only O(chunk × K)), independent of response
+                              length. The GPU path further caps this by free
+                              memory. Default 512 (raised from 128 since the
+                              top-K reduction no longer needs full-vocab fp32
+                              buffers).
   KL_ON_CPU                   If 1, run chunked KL on CPU (slower, saves GPU
                               headroom). Default 0 (KL on worker-local cuda:0).
   KL_SCORE_BATCH              Rollouts per batched HF forward (left-padded).
@@ -161,7 +166,9 @@ Important env vars
   OPD_REVERSE_KL_BETA         beta in  L = beta*KL(s||t) + (1-beta)*KL(t||s).
                               Default 0.7 (reverse-leaning, mode-seeking).
   OPD_TEMP                    Softmax temperature in the KL. Default 1.0.
-  K_EVAL                      K-fold count per segment in PR eval. Default 8.
+  K_EVAL_EARLY / K_EVAL_LATE / K_EVAL_EARLY_EPOCHS
+                              K-fold count per segment in PR eval. Default:
+                              K=4 for the first 3 epochs, K=8 thereafter.
   N_EPOCHS                    Outer epochs. Default 5.
   GKD_LR / GKD_BATCH_SIZE / GKD_GRAD_ACCUM / GKD_MAX_LEN / GKD_WARMUP /
   GKD_LR_SCHEDULE             Step 6 training knobs (GKD_BATCH_SIZE default 4).
@@ -213,13 +220,13 @@ from process_reward_distill import (  # noqa: E402
 )
 
 # ─── Models ──────────────────────────────────────────────────────────────────
-STUDENT_MODEL = os.environ.get("STUDENT_MODEL", "Qwen/Qwen3-1.7B")
-TEACHER_MODEL = os.environ.get("TEACHER_MODEL", "Qwen/Qwen3-32B")
+STUDENT_MODEL = os.environ.get("STUDENT_MODEL", "Qwen/Qwen2.5-1.5B")
+TEACHER_MODEL = os.environ.get("TEACHER_MODEL", "Qwen/Qwen2.5-32B")
 N_GPUS        = torch.cuda.device_count()
 
 # ─── Reproducibility / pool sizing ───────────────────────────────────────────
 SEED      = int(os.environ.get("SEED", "42"))
-N_SAMPLES = int(os.environ.get("N_SAMPLES", "0"))   # 0 = use full local MATH pool
+N_SAMPLES = int(os.environ.get("N_SAMPLES", "1000"))   # 0 = use full local MATH pool
 
 # ─── Dataset config (local; used by phase 0 and the local MATH loader) ───────
 DATASET = "hendrycks_math"
@@ -250,12 +257,14 @@ EPOCH_MAX_MODEL_LEN  = int(os.environ.get(
 
 # vLLM mini-batching inside the student worker. 0 = process the entire
 # work-set in a single call (only safe for small pools).
-INFERENCE_BATCH_SIZE = int(os.environ.get("INFERENCE_BATCH_SIZE", "800"))
+INFERENCE_BATCH_SIZE = int(os.environ.get("INFERENCE_BATCH_SIZE", "0"))
 
-# K-fold count per segment endpoint in the PR eval stage. K=8 keeps per-PR
-# std around 0.25; K=4 (the value used in process_reward_distill) is too
-# noisy for the threshold/ordering signal we rely on here.
-K_EVAL = int(os.environ.get("K_EVAL", "8"))
+# K-fold count per segment endpoint in the PR eval stage. Early epochs use
+# K=4 (cheaper; same as process_reward_distill); from epoch 4 onward use
+# K=8 for a tighter per-PR std (~0.25) on the threshold/ordering signal.
+K_EVAL_EARLY        = int(os.environ.get("K_EVAL_EARLY", "4"))
+K_EVAL_LATE         = int(os.environ.get("K_EVAL_LATE", "8"))
+K_EVAL_EARLY_EPOCHS = int(os.environ.get("K_EVAL_EARLY_EPOCHS", "3"))
 
 
 # ─── Consistency / masking knobs ─────────────────────────────────────────────
@@ -344,10 +353,9 @@ TEST_EVAL_SAMPLES = int(os.environ.get("TEST_EVAL_SAMPLES", "500"))
 # Accepted values:
 #   "hendrycks_math" | "math"  → Hendrycks et al. MATH (7 subsets)
 #                                Loaded LOCALLY via datasets.load_from_disk
-#                                from LOCAL_MATH_DATA_DIR (the combined
-#                                train+test set is split deterministically;
-#                                LOCAL_MATH_TEST_HOLDOUT problems are held
-#                                out for held-out eval).
+#                                from LOCAL_MATH_DATA_DIR (train split).
+#                                Step 7 eval uses the official test split
+#                                from LOCAL_MATH_TEST_DATA_DIR → test_set.jsonl.
 #   "dapo_math_17k"           → DAPO-Math-17k (~17k, train only). Requires
 #                                DAPO_SHARDS pointing to locally readable
 #                                arrow shards.
@@ -374,9 +382,9 @@ LOCAL_MATH_TEST_DATA_DIR = os.environ.get(
     "LOCAL_MATH_TEST_DATA_DIR",
     "/home/ubuntu/chenyang/opd/data/hendrycks_math_test",
 )
-# How many problems to deterministically carve off the combined local MATH
-# set for the held-out test split. Default 0: use all data for training;
-# the proper test set comes from LOCAL_MATH_TEST_DATA_DIR instead.
+# Legacy: optionally carve N problems off the combined local MATH set before
+# training (LOCAL_MATH_TEST_HOLDOUT > 0). Default 0 (disabled); eval uses
+# LOCAL_MATH_TEST_DATA_DIR → test_set.jsonl instead.
 LOCAL_MATH_TEST_HOLDOUT = int(os.environ.get("LOCAL_MATH_TEST_HOLDOUT", "0"))
 _MATH_SUBSETS = [
     "algebra", "counting_and_probability", "geometry",
@@ -397,8 +405,6 @@ OUTPUT_DIR = Path(os.environ.get(
 
 POOL_JSONL             = OUTPUT_DIR / "pool.jsonl"
 TEST_SET_JSONL         = OUTPUT_DIR / "test_set.jsonl"
-TRAIN_EVAL_JSONL       = OUTPUT_DIR / "train_eval_set.jsonl"
-TRAIN_EVAL_SOLVED      = OUTPUT_DIR / "train_eval_solved.json"
 EVAL_LOG_JSONL         = OUTPUT_DIR / "eval_log.jsonl"
 CKPT_BASE_DIR          = OUTPUT_DIR / "checkpoints"
 RETRY_POOL_JSONL       = OUTPUT_DIR / "retry_pool.jsonl"
@@ -559,16 +565,11 @@ def _load_math_local_split(seed=SEED, test_holdout=None):
 
 
 def _load_pool_samples_normalized():
-    """Returns the training pool as list[{problem, gt_answer}]. For MATH the
-    held-out test set is also cached on the module for test_set.jsonl setup.
-    """
-    global _LOCAL_MATH_TEST_CACHE
+    """Returns the training pool as list[{problem, gt_answer}]."""
     if POOL_DATASET == "dapo_math_17k":
-        _LOCAL_MATH_TEST_CACHE = []
         return _load_dapo_samples_normalized()
 
-    train_pool, test_pool = _load_math_local_split()
-    _LOCAL_MATH_TEST_CACHE = test_pool
+    train_pool, _test_pool = _load_math_local_split()
 
     if N_SAMPLES > 0 and N_SAMPLES < len(train_pool):
         rng = random.Random(SEED + 1)  # different sub-stream from the test split
@@ -578,9 +579,6 @@ def _load_pool_samples_normalized():
               f"(N_SAMPLES={N_SAMPLES})", flush=True)
     return [{"problem": s["problem"], "gt_answer": s["gt_answer"]}
             for s in train_pool]
-
-
-_LOCAL_MATH_TEST_CACHE = []   # populated by _load_pool_samples_normalized
 
 
 # ─── Outer LR schedule ───────────────────────────────────────────────────────
@@ -594,6 +592,13 @@ def _lr_for_epoch(base_lr, epoch_idx, n_epochs, schedule):
     if schedule == "cosine":
         return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
     raise ValueError(f"Unknown GKD_LR_SCHEDULE: {schedule}")
+
+
+def _k_eval_for_epoch(epoch_idx):
+    """K-fold sample count for Step-3 PR eval (0-based epoch index)."""
+    if epoch_idx < K_EVAL_EARLY_EPOCHS:
+        return K_EVAL_EARLY
+    return K_EVAL_LATE
 
 
 # ─── Training pool (full dataset; no teacher pre-filter) ─────────────────────
@@ -966,7 +971,9 @@ def _epoch_student_worker(cfg_path, out_path):
     workset_jsonl  = cfg["workset_jsonl"]
     rollouts_jsonl = cfg["rollouts_jsonl_out"]
     shard_idx      = int(cfg.get("shard_idx", 0))
-    n_shards            = max(1, int(cfg.get("n_shards", 1)))
+    n_shards       = max(1, int(cfg.get("n_shards", 1)))
+    epoch_idx      = int(cfg.get("epoch_idx", 0))
+    k_eval         = int(cfg.get("k_eval", _k_eval_for_epoch(epoch_idx)))
 
     workset_all = load_jsonl(workset_jsonl)
     workset = [(i, rec) for i, rec in enumerate(workset_all)
@@ -980,7 +987,8 @@ def _epoch_student_worker(cfg_path, out_path):
         return
 
     print(f"\n[student worker {shard_idx + 1}/{n_shards}] processing "
-          f"{len(workset)}/{len(workset_all)} workset items", flush=True)
+          f"{len(workset)}/{len(workset_all)} workset items  "
+          f"(K_EVAL={k_eval}, epoch={epoch_idx + 1})", flush=True)
 
     workset_orig_idx = [i for (i, _) in workset]
     workset_items    = [rec for (_, rec) in workset]
@@ -993,7 +1001,7 @@ def _epoch_student_worker(cfg_path, out_path):
         top_k=50, top_p=1.0, max_tokens=MAX_NEW_TOKENS,
     )
     kfold_params = SamplingParams(
-        n=K_EVAL, temperature=EVAL_TEMPERATURE,
+        n=k_eval, temperature=EVAL_TEMPERATURE,
         top_k=50, top_p=1.0,
         max_tokens=MAX_ANSWER_TOKENS, stop=["<|im_end|>"],
     )
@@ -1073,7 +1081,7 @@ def _epoch_student_worker(cfg_path, out_path):
             corrects = [
                 answers_match(extract_boxed_answer(o.text), gt) for o in out.outputs
             ]
-            acc_per_li.setdefault(li, {})[ep_idx] = sum(corrects) / K_EVAL
+            acc_per_li.setdefault(li, {})[ep_idx] = sum(corrects) / k_eval
 
         # ── Assemble per-item rollout record ─────────────────────────────
         for li, (item, resp, episodes, rids) in enumerate(zip(
@@ -1356,18 +1364,28 @@ def _kl_chunked_topk_kl(s_resp, t_resp, temp, kl_chunk, topk):
     chunk_eff = kl_chunk
     if kl_device.type == "cuda":
         free_b, _ = torch.cuda.mem_get_info(kl_device.index or 0)
-        row_bytes = max(vocab, 1) * 4 * 4
-        chunk_eff = max(1, min(kl_chunk, int((free_b * 0.15) // row_bytes)))
+        # Unlike the old full-vocab path (which materialised ~4 [chunk, V]
+        # fp32 buffers: the two logit casts plus the log_softmax/kl_div
+        # temporaries), the top-K reduction only reads the two [chunk, V]
+        # logit slices in their NATIVE dtype (topk/gather operate in place)
+        # and upcasts just the tiny [chunk, K] subsets. Budget the 2 native
+        # slices + ~1 extra for topk's workspace, and use a larger share of
+        # free memory since the per-row cost dropped ~8x.
+        elem = max(s_resp.element_size(), t_resp.element_size())
+        row_bytes = max(vocab, 1) * elem * 3
+        chunk_eff = max(1, min(kl_chunk, int((free_b * 0.30) // row_bytes)))
 
     for st in range(0, resp_len, chunk_eff):
         ed = min(st + chunk_eff, resp_len)
-        t_bl = t_resp[st:ed].float()
-        s_bl = s_resp[st:ed].float()
-        # S_t = teacher top-K support on this block (TopK_q).
-        tk = torch.topk(t_bl, k=kk, dim=-1)
+        t_blk = t_resp[st:ed]                             # [b, V] native dtype
+        # S_t = teacher top-K support on this block (TopK_q), selected in the
+        # native dtype — no full-vocab fp32 copy.
+        tk = torch.topk(t_blk, k=kk, dim=-1)
+        idx = tk.indices
         # Gather teacher + student logits on S_t and renormalise over S_t only.
-        t_top = tk.values / temp                          # [b, kk]
-        s_top = s_bl.gather(-1, tk.indices) / temp        # [b, kk]
+        # Only the [b, kk] subsets are upcast to fp32 for the KL math.
+        t_top = tk.values.float() / temp                  # [b, kk]
+        s_top = s_resp[st:ed].gather(-1, idx).float() / temp  # [b, kk]
         t_log = F.log_softmax(t_top, dim=-1)              # log q_hat  over S_t
         s_log = F.log_softmax(s_top, dim=-1)              # log pi_hat over S_t
         kl_fwd = F.kl_div(s_log, t_log, log_target=True,
@@ -1379,9 +1397,9 @@ def _kl_chunked_topk_kl(s_resp, t_resp, temp, kl_chunk, topk):
         for j in range(ed - st):
             kl_fwd_list[st + j] = float(kl_fwd_cpu[j])
             kl_rev_list[st + j] = float(kl_rev_cpu[j])
-        cache_idx_rows[st:ed, :kk] = tk.indices.to(torch.int32).cpu()
+        cache_idx_rows[st:ed, :kk] = idx.to(torch.int32).cpu()
         cache_lgt_rows[st:ed, :kk] = tk.values.to(torch.bfloat16).cpu()
-        del t_bl, s_bl, t_top, s_top, t_log, s_log, kl_fwd, kl_rev
+        del t_blk, tk, idx, t_top, s_top, t_log, s_log, kl_fwd, kl_rev
 
     return kl_fwd_list, kl_rev_list, cache_idx_rows, cache_lgt_rows
 
@@ -1575,7 +1593,8 @@ def _epoch_kl_worker(cfg_path, out_path):
     #      memory. Using free bytes is size-agnostic and subtracts the student
     #      already on cuda:0. Response logits are kept on CPU after forward.
     # Note device_map="auto" only bounds *weight placement*; the headroom
-    # above + the chunked bf16→fp32 KL math below (peak O(KL_FWD_CHUNK × V),
+    # above + the chunked top-K KL math below (peak O(KL_FWD_CHUNK × V) for the
+    # native-dtype topk read; the KL itself is only O(KL_FWD_CHUNK × K),
     # independent of resp_len) are what actually keep the forward from OOMing.
     if not torch.cuda.is_available():
         raise RuntimeError("KL worker requires CUDA")
@@ -1644,7 +1663,7 @@ def _epoch_kl_worker(cfg_path, out_path):
     teacher.eval()
     teacher_in_device = teacher.get_input_embeddings().weight.device
 
-    kl_chunk     = max(1, int(os.environ.get("KL_FWD_CHUNK", "128")))
+    kl_chunk     = max(1, int(os.environ.get("KL_FWD_CHUNK", "512")))
     kl_on_cpu    = os.environ.get("KL_ON_CPU", "0").strip().lower() in (
         "1", "true", "yes", "on")
     score_batch  = max(1, int(os.environ.get("KL_SCORE_BATCH", "2")))
@@ -2546,7 +2565,7 @@ def _train_worker(cfg_path):
     torch.cuda.empty_cache()
 
 
-# ─── Step 7: post-training held-out eval ─────────────────────────────────────
+# ─── Step 7: post-training test-set eval ─────────────────────────────────────
 
 def _epoch_eval_worker(cfg_path, out_path):
     from transformers import AutoTokenizer
@@ -2591,7 +2610,7 @@ def _epoch_eval_worker(cfg_path, out_path):
                 n_correct += 1
         return n_correct, len(indexed_records), newly
 
-    print(f"\n[Step 7 shard {shard_idx + 1}/{n_shards}] Held-out evaluations …",
+    print(f"\n[Step 7 shard {shard_idx + 1}/{n_shards}] Test-set evaluation …",
           flush=True)
     test_records = load_jsonl(TEST_SET_JSONL) if TEST_SET_JSONL.exists() else []
 
@@ -2682,8 +2701,10 @@ def run_epoch(epoch_idx, current_ckpt, pool):
         gpw       = 1
         n_workers = max(1, n_visible)
 
+        k_eval_this_epoch = _k_eval_for_epoch(epoch_idx)
         print(f"\n[Steps 1-3] Spawning {n_workers} student worker(s)  "
-              f"(visible_gpus={physical_ids}, DP tp=1 per worker) …",
+              f"(visible_gpus={physical_ids}, DP tp=1 per worker, "
+              f"K_EVAL={k_eval_this_epoch}) …",
               flush=True)
 
         shard_cfgs, shard_outs, shard_rollouts = [], [], []
@@ -2702,6 +2723,8 @@ def run_epoch(epoch_idx, current_ckpt, pool):
                     "rollouts_jsonl_out": str(shard_rollouts_jsonl),
                     "shard_idx":          w,
                     "n_shards":           n_workers,
+                    "epoch_idx":          epoch_idx,
+                    "k_eval":             k_eval_this_epoch,
                 }, f)
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = ",".join(worker_phys)
@@ -3136,7 +3159,8 @@ def main():
           f"(only paragraphs with inconsistency > 0 are actually masked)")
     print(f"  MIN_MERGED_SEGS_PER_RESP   = {MIN_MERGED_SEGS_PER_RESP}")
     print(f"  MAX_RETRIES                = {MAX_RETRIES}")
-    print(f"  K_EVAL                     = {K_EVAL}")
+    print(f"  K_EVAL                     = {K_EVAL_EARLY} (epochs 1–"
+          f"{K_EVAL_EARLY_EPOCHS}), then {K_EVAL_LATE}")
     print(f"  KL_TOPK                    = {KL_TOPK}  "
           f"(teacher top-K cached for Step 6; consistency KL on teacher top-K support S_t)")
     print(f"  KL_GPUS_PER_WORKER         = {KL_GPUS_PER_WORKER}  "

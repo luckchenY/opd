@@ -4,9 +4,10 @@ set -uo pipefail
 # ========================================
 # 每次只需要改这一个参数（GPU 自动检测）
 # ========================================
-MODEL_PATH=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/models/Qwen3-1.7B
+# 本地 checkpoint 路径，或 HuggingFace/ModelScope 模型名（base 模型直接填名字）
+# MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
+MODEL_PATH=/home/ubuntu/chenyang/opd/tools/consistency_opd_output/checkpoints/epoch_002
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
 # GPU 选择：
 #   1) 如果调用方设置了 CUDA_VISIBLE_DEVICES，就用它指定的卡（脚本不会改写它）
 #   2) 否则用本机 nvidia-smi 看到的全部卡
@@ -14,14 +15,15 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 # 单机评测里这是最快的并行方式（无 TP 通信开销，吞吐随卡数近线性增长）。
 # ========================================
 
-PASS_K=8
+PASS_K=1
 TEMPERATURE=1
-TOP_P=0.8
+TOP_P=0.95
+TOP_K=50
+
 # 每档分别做一次独立的 swift eval，跑完立即拿到该长度的官方指标（不做截断）
-MAX_NEW_TOKENS_SWEEP=(4096  8192 16384 32768)
+MAX_NEW_TOKENS_SWEEP=(16384)
 
-DATA_DIR=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/data/aime_datasets
-
+DATA_DIR=/home/ubuntu/chenyang/opd/data/aime_datasets
 # ------------------------------------------------------------------
 # 自动检测 GPU 列表
 # ------------------------------------------------------------------
@@ -46,13 +48,14 @@ VLLM_TP_SIZE=1
 EVAL_NUM_PROC=$((16 * NUM_GPUS))
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EVAL_ROOT_DIR="${MODEL_PATH}/eval_results/${TIMESTAMP}"
+# 将模型名中的 / 替换为 __，用作目录名（兼容本地路径和 HF 模型名）
+MODEL_NAME_SAFE=$(basename "${MODEL_PATH}" | tr '/' '__')
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL_ROOT_DIR="${SCRIPT_DIR}/test_result/${MODEL_NAME_SAFE}/${TIMESTAMP}"
 STATS_TSV="${EVAL_ROOT_DIR}/stats.tsv"
 
-# 唯一的 run id：写进子进程环境变量，用于识别"哪些进程是本次 bash 启动的"。
-# 即使同一张卡上同时跑其他人的 swift/vLLM，也不会被误杀。
-EVAL_AIME_RUN_ID="eval_aime_$$_$(date +%s)_$(echo "${GPU_LIST}" | tr ',' '-')"
-export EVAL_AIME_RUN_ID
+# 当前正在跑的 swift eval 进程组 ID（= setsid 后的 swift_pid）；空表示无
+CURRENT_SWIFT_PGID=""
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 
@@ -76,159 +79,57 @@ echo "Port:       ${PORT}"
 echo "Eval proc:  ${EVAL_NUM_PROC}"
 echo "Sweep:      ${MAX_NEW_TOKENS_SWEEP[*]}"
 echo "Stats:      ${STATS_TSV}"
-echo "Run ID:     ${EVAL_AIME_RUN_ID}"
 echo "=========================================="
 
-# 兜底：脚本被 Ctrl+C / kill / 正常退出时，清掉本次 run 的所有残留（孤儿 EngineCore 也在内）
-# EXIT 只做清理；INT/TERM 先清理再立即退出（避免主循环继续跑 / 反复触发 handler）
+# ------------------------------------------------------------------
+# 进程组清理：用 setsid 让 swift eval 自成一个新 session（PGID = swift_pid）。
+# 子孙进程（包括 vLLM EngineCore）继承 PGID；即使被 PID 1 收养，PGID 也不变。
+# kill -TERM/-KILL -$PGID 直接由内核投递给整组，无需任何 /proc 扫描。
+# ------------------------------------------------------------------
+
+# 杀掉当前 stage 的整个进程组，并等待其退出
+_kill_current_stage() {
+    [ -z "${CURRENT_SWIFT_PGID}" ] && return 0
+    local pgid="${CURRENT_SWIFT_PGID}"
+    echo "[info]  sending SIGTERM to process group ${pgid}"
+    kill -TERM -"${pgid}" 2>/dev/null || true
+    local i
+    for i in $(seq 1 8); do
+        kill -0 -"${pgid}" 2>/dev/null || { CURRENT_SWIFT_PGID=""; return 0; }
+        sleep 1
+    done
+    echo "[warn]  SIGKILL process group ${pgid}"
+    kill -KILL -"${pgid}" 2>/dev/null || true
+    sleep 2
+    CURRENT_SWIFT_PGID=""
+}
+
+# 等端口释放（vLLM 退出后端口可能晚一两秒才关）
+_wait_port_free() {
+    local wait_sec="${1:-60}"
+    local i
+    for i in $(seq 1 "${wait_sec}"); do
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}$" || return 0
+        sleep 1
+    done
+    echo "[warn]  port ${PORT} still busy after ${wait_sec}s"
+}
+
+# 兜底：脚本被 Ctrl+C / kill / 正常退出时，清掉当前 stage 的进程组
 _on_exit() {
-    echo "[info]  cleanup on exit: run ${EVAL_AIME_RUN_ID}"
-    _kill_run_residuals 2>/dev/null || true
+    echo "[info]  cleanup on exit"
+    _kill_current_stage 2>/dev/null || true
 }
 _on_signal() {
     local sig="$1"
-    echo "[info]  got ${sig}, aborting run ${EVAL_AIME_RUN_ID}"
-    _kill_run_residuals 2>/dev/null || true
+    echo "[info]  got ${sig}, aborting"
+    _kill_current_stage 2>/dev/null || true
     trap - EXIT INT TERM
     exit 130
 }
 trap '_on_exit' EXIT
 trap '_on_signal INT'  INT
 trap '_on_signal TERM' TERM
-
-# ------------------------------------------------------------------
-# 三重判定识别"本次脚本产生的进程"（包括被 PID 1 收养的孤儿 VLLM::EngineCore）：
-#   A) 进程环境变量里有 EVAL_AIME_RUN_ID=${EVAL_AIME_RUN_ID} （正常子进程）
-#   B) pid 当前出现在 ${GPU_LIST} 任一卡上 且 不在 GPU_BASELINE_PIDS 里（本 run 启动前已有的 pid）
-#      —— 用来抓环境被清空的孤儿 EngineCore
-# 两者取并集。别人 run 启动的进程不会被杀（不满足 A；若出现在 B，说明是本 run 启动后新增的在本卡上跑的进程，
-# 同卡别人的进程不会被误杀 —— 因为启动前就在 baseline 里了）。
-# ------------------------------------------------------------------
-
-# 快照本次 run 涉及的所有卡上"启动前就存在的 pid 集合"。以后所有"GPU 新增 pid"都视为本 run 产物。
-# 同时用 lsof 快照持有 /dev/nvidia<id> fd 的进程——这能抓到孤儿 EngineCore 等
-# nvidia-smi --query-compute-apps 报不出来但实际持有 fd 的进程。
-_snapshot_gpu_baseline() {
-    local gid smi_pids lsof_pids merged
-    merged=""
-    for gid in "${GPU_IDS_ARRAY[@]}"; do
-        smi_pids=$(nvidia-smi --id="${gid}" --query-compute-apps=pid \
-            --format=csv,noheader 2>/dev/null | tr -d ' ')
-        lsof_pids=$(lsof "/dev/nvidia${gid}" 2>/dev/null | awk 'NR>1{print $2}')
-        merged+=$'\n'"${smi_pids}"$'\n'"${lsof_pids}"
-    done
-    GPU_BASELINE_PIDS=$(printf '%s\n' "${merged}" | tr -s ' ' '\n' | sort -u | sed '/^$/d')
-    echo "[info]  GPUs ${GPU_LIST} baseline pids at start: ${GPU_BASELINE_PIDS//$'\n'/ } (these will NEVER be killed)"
-}
-
-_pid_env_has_run_id() {
-    local pid="$1"
-    local env_file="/proc/${pid}/environ"
-    [ -r "${env_file}" ] || return 1
-    # 过滤 bash 子 shell / 常见小工具：它们会继承 EVAL_AIME_RUN_ID（来自
-    # $(...) 命令替换 / 管道），但不是我们要杀的 swift / vLLM 进程。
-    # 不过滤的话，脚本每次扫 /proc 都会把自己的命令替换子 shell 当成
-    # "本 run 残留"来杀，导致 _wait_stage_clean 永远不返回 0。
-    local comm
-    comm=$(cat "/proc/${pid}/comm" 2>/dev/null) || return 1
-    case "${comm}" in
-        bash|sh|dash|zsh|grep|awk|sed|sort|tr|tail|head|cat|stat|seq|sleep|date|kill|pgrep|pkill|nvidia-smi|ss|ps|tee|find|xargs|wc|readlink|basename|dirname)
-            return 1 ;;
-    esac
-    grep -qzxF "EVAL_AIME_RUN_ID=${EVAL_AIME_RUN_ID}" "${env_file}" 2>/dev/null
-}
-
-_pid_in_baseline() {
-    local pid="$1"
-    [ -z "${GPU_BASELINE_PIDS:-}" ] && return 1
-    echo "${GPU_BASELINE_PIDS}" | grep -qxF "${pid}"
-}
-
-# GPU 上"新增"的、不在 baseline 里的进程 —— 都是本 run 产物（含孤儿 EngineCore）
-# 双通道，对 GPU_LIST 中的每一张卡都扫：
-#   1. nvidia-smi --query-compute-apps：抓到正常 CUDA 进程
-#   2. lsof /dev/nvidia<id>：抓到 nvidia-smi 认不出来但仍持有 fd 的孤儿进程
-#      （vLLM EngineCore 被 PID 1 收养后常常只剩 fd，smi 看不到它但它确实占着显存）
-_list_gpu_new_pids() {
-    local gid smi_pids lsof_pids merged p
-    merged=""
-    for gid in "${GPU_IDS_ARRAY[@]}"; do
-        smi_pids=$(nvidia-smi --id="${gid}" --query-compute-apps=pid \
-            --format=csv,noheader 2>/dev/null | tr -d ' ')
-        lsof_pids=$(lsof "/dev/nvidia${gid}" 2>/dev/null | awk 'NR>1{print $2}')
-        merged+=$'\n'"${smi_pids}"$'\n'"${lsof_pids}"
-    done
-    merged=$(printf '%s\n' "${merged}" | tr -s ' ' '\n' | sort -u | sed '/^$/d')
-    for p in ${merged}; do
-        [ -z "${p}" ] && continue
-        # 只报告真实存在的进程（过滤 smi 返回的僵尸 PID）
-        [ -d "/proc/${p}" ] || continue
-        _pid_in_baseline "${p}" && continue
-        echo "${p}"
-    done
-}
-
-# 普通判定：环境变量有 run id 的进程（非 GPU 进程也算，比如 swift 主进程、evalscope worker）
-_list_env_matched_pids() {
-    local pid
-    for pid in /proc/[0-9]*; do
-        pid=${pid##*/}
-        [ "${pid}" = "$$" ] && continue
-        _pid_env_has_run_id "${pid}" && echo "${pid}"
-    done
-}
-
-# 合并 A ∪ B 并去重
-_list_run_pids() {
-    {
-        _list_env_matched_pids
-        _list_gpu_new_pids
-    } | sort -u
-}
-
-_kill_run_residuals() {
-    local pids
-    pids=$(_list_run_pids)
-    [ -z "${pids}" ] && return 0
-    echo "[info]  killing run residuals on GPUs ${GPU_LIST}: ${pids//$'\n'/ }"
-    # shellcheck disable=SC2086
-    kill -TERM ${pids} 2>/dev/null || true
-    local i
-    for i in $(seq 1 5); do
-        pids=$(_list_run_pids)
-        [ -z "${pids}" ] && return 0
-        sleep 1
-    done
-    pids=$(_list_run_pids)
-    if [ -n "${pids}" ]; then
-        echo "[warn]  SIGKILL residuals: ${pids//$'\n'/ }"
-        # shellcheck disable=SC2086
-        kill -KILL ${pids} 2>/dev/null || true
-    fi
-    sleep 3
-}
-
-# 等待：本 run 进程全清 + 端口释放（不要求 GPU 整体显存空，因为可能有别人在同卡跑）
-_wait_stage_clean() {
-    # 等待本次 run 的残留进程清理、端口释放。
-    # 默认等待时间设置更长，避免大模型/vLLM 退出释放显存与端口较慢时误判。
-    local wait_sec="${1:-180}"
-    local i pids
-    for i in $(seq 1 "${wait_sec}"); do
-        pids=$(_list_run_pids)
-        if [ -z "${pids}" ] && ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}$"; then
-            return 0
-        fi
-        sleep 1
-    done
-    pids=$(_list_run_pids)
-    if [ -n "${pids}" ]; then
-        echo "[warn]  after ${wait_sec}s, still have residual pids: ${pids//$'\n'/ }; forcing SIGKILL"
-        # shellcheck disable=SC2086
-        kill -KILL ${pids} 2>/dev/null || true
-        sleep 2
-    fi
-}
 
 # ------------------------------------------------------------------
 # 封装：一次 swift eval，防 hang，结束后按 run_id 精确清理。
@@ -241,18 +142,23 @@ run_one_eval() {
 
     mkdir -p "$(dirname "${log_path}")"
 
-    # 进场前：清掉上一 stage 的残留（只限本 run）
-    _kill_run_residuals
-    _wait_stage_clean 180
+    # 进场前：确保上一 stage 的进程组已经退出
+    _kill_current_stage
+    _wait_port_free 60
 
-    # EVAL_AIME_RUN_ID 已 export，子进程自动继承；这里再显式传 CUDA_VISIBLE_DEVICES
-    CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
-    PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
+    # setsid：让 swift eval 在全新 session 里运行，自动成为新进程组的 leader（PGID = PID）。
+    # 子孙进程（含 vLLM EngineCore）继承该 PGID；即使被 PID 1 收养，PGID 也不变。
+    # 后续只需 kill -TERM/-KILL -$PGID 即可整组清理，无需任何 /proc 扫描。
+    setsid env \
+        CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+        PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
     swift eval \
         --model "${MODEL_PATH}" \
         --port "${PORT}" \
+        --model_type qwen3 \
+        --template qwen3 \
         --eval_backend Native \
-        --eval_dataset aime24 aime25 aime26 \
+        --eval_dataset aime24 aime25 \
         --eval_dataset_args "{
             \"aime24\": {\"local_path\": \"${DATA_DIR}/aime24_local\", \"aggregation\": \"mean_and_pass_at_k\"},
             \"aime25\": {\"local_path\": \"${DATA_DIR}/aime25_local\", \"aggregation\": \"mean_and_pass_at_k\"},
@@ -267,13 +173,16 @@ run_one_eval() {
         --max_new_tokens "${max_new_tokens}" \
         --temperature "${TEMPERATURE}" \
         --top_p "${TOP_P}" \
+        --top_k "${TOP_K}" \
+        --enable_thinking false \
         --attn_impl flash_attn \
         --torch_dtype bfloat16 \
         --stream false \
         --eval_output_dir "${out_dir}" \
         >"${log_path}" 2>&1 &
     local swift_pid=$!
-    echo "[info]  swift eval pid=${swift_pid}  max_new_tokens=${max_new_tokens}  (tail -f ${log_path})"
+    CURRENT_SWIFT_PGID=${swift_pid}   # setsid 后 PID = PGID，整组用这个 id 清理
+    echo "[info]  swift eval pid/pgid=${swift_pid}  max_new_tokens=${max_new_tokens}  (tail -f ${log_path})"
 
     local DONE_MARK='End time of running main'
     # vLLM / EngineCore 启动失败时通常会很快写出明确错误；提前识别可避免卡在 STALL_TIMEOUT 才被判 hang。
@@ -339,24 +248,9 @@ run_one_eval() {
         sleep 5
     done
 
-    # 命中 hang 时，主动先 KILL 主 pid，避免 TERM 不动或 D 状态把后面的 wait 挂死
-    if [ "${hang}" = "1" ] && kill -0 "${swift_pid}" 2>/dev/null; then
-        kill -KILL "${swift_pid}" 2>/dev/null || true
-    fi
-
-    # 收尾：杀掉本次 run 的所有残留（孤儿 EngineCore 也在内）
-    _kill_run_residuals
-
-    # wait 加超时保险：后台等最多 30s，防止 D 状态把脚本钉死
-    ( wait "${swift_pid}" 2>/dev/null ) &
-    local wpid=$!
-    for _ in $(seq 1 30); do
-        kill -0 "${wpid}" 2>/dev/null || break
-        sleep 1
-    done
-    kill -KILL "${wpid}" 2>/dev/null || true
-
-    _wait_stage_clean 120
+    # 收尾：杀掉整个进程组（含孤儿 EngineCore），然后等端口释放
+    _kill_current_stage
+    _wait_port_free 120
     echo "[info]  stage max_new_tokens=${max_new_tokens} exited"
 }
 
@@ -396,9 +290,6 @@ PY
 # ------------------------------------------------------------------
 # 主循环
 # ------------------------------------------------------------------
-# 先快照本卡上已经存在的 GPU 进程（别人开的任务）。这些 pid 永远不会被杀。
-_snapshot_gpu_baseline
-
 FAILED=()
 for L in "${MAX_NEW_TOKENS_SWEEP[@]}"; do
     echo ""
