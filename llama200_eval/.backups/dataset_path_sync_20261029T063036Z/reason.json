@@ -1,0 +1,6 @@
+{
+  "reason": "User moved AIME/GPQA data and changed launcher dataset_args; synchronize CPU preflight to the same existing paths. Entrypoint left untouched.",
+  "before_sha256": "eb5cefe42e2d698b66519e9d32d616a726e0bc57723ae89e3ea01f8f64410502",
+  "old_prefix": "/data/chenyang/opd/data/",
+  "new_prefix": "/data/chenyang/opdswift/data/data/"
+}

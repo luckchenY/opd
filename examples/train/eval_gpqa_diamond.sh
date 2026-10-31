@@ -1,0 +1,581 @@
+#!/bin/bash
+set -uo pipefail
+
+# ========================================
+# GPQA-Diamond：沿用 eval_aime.sh 的模型、GPU 和采样配置
+# ========================================
+# 本地 checkpoint 路径，或 HuggingFace/ModelScope 模型名（base 模型直接填名字）
+# MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
+MODEL_PATH=${MODEL_PATH:-/data/chenyang/models/Qwen3-1.7B}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,4,5,7}
+# 每题重复采样 4 次；主要看 mean_acc，pass@4 作为辅助指标。
+PASS_K=${PASS_K:-4}
+EVAL_SEED=${EVAL_SEED:-42}
+EVAL_REQUEST_TIMEOUT=${EVAL_REQUEST_TIMEOUT:-3600}
+EVAL_REQUEST_ATTEMPTS=${EVAL_REQUEST_ATTEMPTS:-2}
+EVAL_HARD_TIMEOUT=${EVAL_HARD_TIMEOUT:-43200}
+EVAL_STALL_TIMEOUT=${EVAL_STALL_TIMEOUT:-$((EVAL_REQUEST_TIMEOUT + 120))}
+TEMPERATURE=0.6
+TOP_P=0.95
+TOP_K=50
+# Keep headroom for existing GPU allocations; allow an environment override.
+VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.7}
+# auto: local workaround for vLLM 0.23.0; 0: disable; 1: explicit force.
+export VLLM_DENSE_DP_LB_FIX=${VLLM_DENSE_DP_LB_FIX:-auto}
+
+# 每档分别做一次独立的 swift eval，跑完立即拿到该长度的官方指标（不做截断）
+MAX_NEW_TOKENS_SWEEP=(32768)
+
+DATA_DIR=${DATA_DIR:-/data/chenyang/opd/data/gpqa_datasets}
+DATASET_PATH=${DATA_DIR}/gpqa_diamond_local
+EXPECTED_QUESTIONS=198
+
+# 在已安装 swift/EvalScope 的环境中运行（例如 conda activate swift）。
+for required_cmd in swift python3 setsid ss; do
+    if ! command -v "${required_cmd}" >/dev/null 2>&1; then
+        echo "[error] 找不到 ${required_cmd}，请先激活 swift 环境。" >&2
+        exit 1
+    fi
+done
+if ! [[ "${PASS_K}" =~ ^[1-9][0-9]*$ && "${EVAL_SEED}" =~ ^[0-9]+$ ]]; then
+    echo "[error] PASS_K 必须为正整数，EVAL_SEED 必须为非负整数。" >&2
+    exit 1
+fi
+if ! python3 - "${DATASET_PATH}" <<'PY'
+from pathlib import Path
+import sys
+import pyarrow.parquet as pq
+
+path = Path(sys.argv[1]) / 'train-00000-of-00001.parquet'
+if not path.is_file():
+    raise SystemExit(f'[error] GPQA-Diamond 数据不存在: {path}')
+meta = pq.read_metadata(path)
+required = {'Question', 'Correct Answer', 'Incorrect Answer 1',
+            'Incorrect Answer 2', 'Incorrect Answer 3'}
+missing = required - set(meta.schema.names)
+if meta.num_rows != 198 or missing:
+    raise SystemExit(f'[error] 数据应为 198 题且字段完整，实际 rows={meta.num_rows}, missing={missing}')
+print(f'[info] GPQA-Diamond 本地数据检查通过: {meta.num_rows} questions')
+PY
+then
+    exit 1
+fi
+# ------------------------------------------------------------------
+# 自动检测 GPU 列表
+# ------------------------------------------------------------------
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    GPU_LIST="${CUDA_VISIBLE_DEVICES}"
+else
+    GPU_LIST=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
+fi
+if [ -z "${GPU_LIST}" ]; then
+    echo "[error] 没有发现可用的 GPU"; exit 1
+fi
+# 解析为数组，兼容 "0,1,2" / "0 1 2" / 带空格 等情况
+GPU_IDS_ARRAY=( $(echo "${GPU_LIST}" | tr ',' ' ') )
+NUM_GPUS=${#GPU_IDS_ARRAY[@]}
+# 重新规范化 GPU_LIST（去空格）
+GPU_LIST=$(IFS=,; echo "${GPU_IDS_ARRAY[*]}")
+
+# 数据并行 = 卡数；张量并行固定 1（模型够小，DP 吞吐最高）
+VLLM_DP_SIZE=${NUM_GPUS}
+VLLM_TP_SIZE=1
+# 评测客户端并发也按卡数放大，确保所有 DP worker 都被喂饱
+EVAL_NUM_PROC=${EVAL_NUM_PROC:-$((4 * NUM_GPUS))}
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# 将模型名中的 / 替换为 __，用作目录名（兼容本地路径和 HF 模型名）
+MODEL_NAME_SAFE=$(basename "${MODEL_PATH}" | tr '/' '__')
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL_ROOT_DIR="${SCRIPT_DIR}/test_result/${MODEL_NAME_SAFE}/${TIMESTAMP}_$$"
+STATS_TSV="${EVAL_ROOT_DIR}/stats.tsv"
+
+# 当前正在跑的 swift eval 进程组 ID（= setsid 后的 swift_pid）；空表示无
+CURRENT_SWIFT_PGID=""
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+
+mkdir -p "${EVAL_ROOT_DIR}"
+# EvalScope 1.8.1 会误删选项中的 [...]，破坏科学表达式。
+# 使用 swift 正式插件入口，仅为本次进程保留方括号；不修改安装库和数据。
+ADAPTER_PLUGIN="${EVAL_ROOT_DIR}/gpqa_diamond_preserve_choices.py"
+cat > "${ADAPTER_PLUGIN}" <<'PY'
+import random
+from evalscope.benchmarks.gpqa.gpqa_adapter import GPQAAdapter
+
+
+def _preserve_gpqa_choices(self, record):
+    def preprocess(text):
+        if text is None:
+            return ' '
+        return text.strip().replace(' [title]', '. ').replace('  ', ' ')
+
+    choices = [preprocess(record[key]) for key in
+               ('Incorrect Answer 1', 'Incorrect Answer 2', 'Incorrect Answer 3', 'Correct Answer')]
+    correct = preprocess(record['Correct Answer'])
+    if choices.count(correct) != 1:
+        raise ValueError('GPQA-Diamond correct answer collides with a distractor')
+    random.shuffle(choices)
+    return {'choices': choices, 'answer': chr(65 + choices.index(correct))}
+
+
+_preserve_gpqa_choices.preserves_square_brackets = True
+GPQAAdapter._process_input = _preserve_gpqa_choices
+print('[info] GPQA-Diamond adapter: preserving square brackets in answer choices')
+
+# Front-end-only workaround for vLLM 0.23.0 dense-DP load feedback.
+# No model, scheduler, sampling, output, or scoring code is changed.
+def _install_dense_dp_load_balancing():
+    import functools
+    import importlib.metadata
+    import os
+    from collections import Counter
+
+    mode = os.environ.get('VLLM_DENSE_DP_LB_FIX', 'auto').strip().lower()
+    if mode not in {'auto', '0', '1'}:
+        raise ValueError('VLLM_DENSE_DP_LB_FIX must be auto, 0, or 1')
+    if mode == '0':
+        return {'installed': False, 'reason': 'disabled'}
+
+    version = importlib.metadata.version('vllm')
+    if mode == 'auto' and version.split('+', 1)[0] != '0.23.0':
+        return {'installed': False, 'reason': 'unverified vLLM version; using native routing',
+                'vllm_version': version}
+
+    from vllm.v1.engine.core_client import DPLBAsyncMPClient
+
+    patch_id = 'gpqa_dense_dp_least_inflight_v1'
+    if getattr(DPLBAsyncMPClient, '_gpqa_dense_dp_lb_patch_id', None) == patch_id:
+        return {'installed': True, 'reason': 'already installed', 'vllm_version': version}
+    if getattr(DPLBAsyncMPClient, '_gpqa_dense_dp_lb_patch_id', None) is not None:
+        raise RuntimeError('A different GPQA DP routing patch is already installed')
+    for method in ('get_core_engine_for_request', 'process_engine_outputs', 'abort_requests_async'):
+        if not callable(getattr(DPLBAsyncMPClient, method, None)):
+            raise RuntimeError(f'Unsupported vLLM DP client API: missing {method}')
+
+    native_init = DPLBAsyncMPClient.__init__
+    native_choose = DPLBAsyncMPClient.get_core_engine_for_request
+
+    @functools.wraps(native_init)
+    def initialize(self, vllm_config, *args, **kwargs):
+        native_init(self, vllm_config, *args, **kwargs)
+        parallel = vllm_config.parallel_config
+        # This script deploys one front end and independent dense TP=1 replicas.
+        # Keep all other deployment modes on their original routing path.
+        self._gpqa_dense_dp_lb_enabled = (
+            not getattr(vllm_config.model_config, 'is_moe', True)
+            and getattr(self, 'client_count', None) == 1
+            and getattr(parallel, 'tensor_parallel_size', None) == 1
+            and not getattr(parallel, 'data_parallel_external_lb', False)
+            and not getattr(parallel, 'data_parallel_hybrid_lb', False)
+            and not getattr(parallel, 'enable_elastic_ep', False)
+            and len(self.core_engines) > 1
+        )
+        self._gpqa_dense_dp_lb_next = getattr(self, 'eng_start_index', 0) % len(self.core_engines)
+        self._gpqa_dense_dp_lb_assigned = [0] * len(self.core_engines)
+        if self._gpqa_dense_dp_lb_enabled:
+            if not isinstance(getattr(self, 'reqs_in_flight', None), dict):
+                raise RuntimeError('Unsupported vLLM DP client: reqs_in_flight is not a dict')
+            print(f'[info] GPQA dense-DP load balancing enabled: '
+                  f'{len(self.core_engines)} replicas, least in-flight, rotating ties', flush=True)
+        else:
+            print('[info] GPQA dense-DP workaround not applicable; using native routing', flush=True)
+
+    @functools.wraps(native_choose)
+    def choose(self, request):
+        if (not getattr(self, '_gpqa_dense_dp_lb_enabled', False)
+                or request.data_parallel_rank is not None
+                or request.pooling_params is not None):
+            return native_choose(self, request)
+
+        previous = self.reqs_in_flight.get(request.request_id)
+        if previous is not None:
+            return previous
+
+        # This synchronous selector and the native completion callback run on
+        # the same event loop. No await occurs between counting and assigning.
+        # Coordinator snapshots can reset lb_engines, but never this request map.
+        counts = Counter(self.reqs_in_flight.values())
+        engines = self.core_engines
+        start = self._gpqa_dense_dp_lb_next
+        rank = min(((start + i) % len(engines) for i in range(len(engines))),
+                   key=lambda i: counts[engines[i]])
+        engine = engines[rank]
+        self.reqs_in_flight[request.request_id] = engine
+        self._gpqa_dense_dp_lb_next = (rank + 1) % len(engines)
+        self._gpqa_dense_dp_lb_assigned[rank] += 1
+
+        assigned = self._gpqa_dense_dp_lb_assigned
+        total = sum(assigned)
+        if total <= len(engines) or total % 64 == 0:
+            outstanding = [counts[engine_id] + (engine_id == engine) for engine_id in engines]
+            print(f'[info] GPQA dense-DP routes: assigned={assigned}, '
+                  f'in_flight={outstanding}, selected_rank={rank}', flush=True)
+        # Preserve native process_engine_outputs and abort_requests_async.
+        # They remove the mapping only when the engine reports completion,
+        # including an acknowledged abort; do not release it prematurely.
+        return engine
+
+    DPLBAsyncMPClient.__init__ = initialize
+    DPLBAsyncMPClient.get_core_engine_for_request = choose
+    DPLBAsyncMPClient._gpqa_dense_dp_lb_patch_id = patch_id
+    return {'installed': True, 'strategy': 'least_inflight_with_rotating_ties',
+            'vllm_version': version, 'mode': mode}
+
+
+DENSE_DP_LB_PATCH_STATUS = _install_dense_dp_load_balancing()
+print(f'[info] GPQA dense-DP patch: {DENSE_DP_LB_PATCH_STATUS}', flush=True)
+PY
+if [ ! -s "${ADAPTER_PLUGIN}" ]; then
+    echo "[error] 无法创建 GPQA 选项保护插件。" >&2
+    exit 1
+fi
+{
+  echo -e "# model_path\t${MODEL_PATH}"
+  echo -e "# gpus\t${GPU_LIST}\tnum_gpus\t${NUM_GPUS}"
+  echo -e "# vllm_parallel\tDP=${VLLM_DP_SIZE}\tTP=${VLLM_TP_SIZE}"
+  echo -e "# repeats\t${PASS_K}\ttemperature\t${TEMPERATURE}\ttop_p\t${TOP_P}"
+  echo -e "# dataset\tgpqa_diamond\tquestions\t198\tfew_shot_num\t0\tseed\t${EVAL_SEED}"
+  echo -e "# data_path\t${DATASET_PATH}"
+  echo -e "# primary_metric\tmean_acc\tsecondary_metric\tmean_acc_pass@${PASS_K}"
+  echo -e "# adapter\tpreserve_square_brackets\tplugin\t${ADAPTER_PLUGIN}"
+  echo -e "# dense_dp_load_balancing\t${VLLM_DENSE_DP_LB_FIX}\tstrategy\tleast_inflight_rotating_ties"
+  echo -e "# request_timeout\t${EVAL_REQUEST_TIMEOUT}\trequest_attempts\t${EVAL_REQUEST_ATTEMPTS}\tsdk_max_retries\t0"
+  echo -e "# eval_num_proc\t${EVAL_NUM_PROC}\tclient_temperature\t${TEMPERATURE}\tclient_top_p\t${TOP_P}\tclient_top_k\t${TOP_K}"
+  echo -e "# strategy\tsweep_max_new_tokens"
+  echo -e "model_path\tmax_new_tokens\tdataset\tmetric\tvalue"
+} > "${STATS_TSV}"
+
+# 端口随首张卡 id 偏移，避免不同 run 端口冲突
+PORT=${PORT:-$((8000 + GPU_IDS_ARRAY[0]))}
+
+echo "=========================================="
+echo "Dataset:    GPQA-Diamond (198 questions, 0-shot, seed=${EVAL_SEED})"
+echo "Model:      ${MODEL_PATH}"
+echo "GPUs:       ${GPU_LIST}        (DP=${VLLM_DP_SIZE}, TP=${VLLM_TP_SIZE})"
+echo "Port:       ${PORT}"
+echo "Eval proc:  ${EVAL_NUM_PROC}"
+echo "Sweep:      ${MAX_NEW_TOKENS_SWEEP[*]}"
+echo "Stats:      ${STATS_TSV}"
+echo "=========================================="
+
+# 杀掉当前 stage 的整个进程组，并等待其退出
+_kill_current_stage() {
+    [ -z "${CURRENT_SWIFT_PGID}" ] && return 0
+    local pgid="${CURRENT_SWIFT_PGID}"
+    echo "[info]  sending SIGTERM to process group ${pgid}"
+    kill -TERM -"${pgid}" 2>/dev/null || true
+    local i
+    for i in $(seq 1 8); do
+        kill -0 -"${pgid}" 2>/dev/null || { CURRENT_SWIFT_PGID=""; return 0; }
+        sleep 1
+    done
+    echo "[warn]  SIGKILL process group ${pgid}"
+    kill -KILL -"${pgid}" 2>/dev/null || true
+    sleep 2
+    CURRENT_SWIFT_PGID=""
+}
+
+# 等端口释放（vLLM 退出后端口可能晚一两秒才关）
+_wait_port_free() {
+    local wait_sec="${1:-60}"
+    local i
+    for i in $(seq 1 "${wait_sec}"); do
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}$" || return 0
+        sleep 1
+    done
+    echo "[error] port ${PORT} still busy after ${wait_sec}s" >&2
+    return 1
+}
+
+# 兜底：脚本被 Ctrl+C / kill / 正常退出时，清掉当前 stage 的进程组
+_on_exit() {
+    echo "[info]  cleanup on exit"
+    _kill_current_stage 2>/dev/null || true
+}
+_on_signal() {
+    local sig="$1"
+    echo "[info]  got ${sig}, aborting"
+    _kill_current_stage 2>/dev/null || true
+    trap - EXIT INT TERM
+    exit 130
+}
+trap '_on_exit' EXIT
+trap '_on_signal INT'  INT
+trap '_on_signal TERM' TERM
+
+# ------------------------------------------------------------------
+# 封装：一次 swift eval，防 hang，结束后按 run_id 精确清理。
+# 参数：$1=max_new_tokens  $2=eval_output_dir  $3=log_path
+# ------------------------------------------------------------------
+run_one_eval() {
+    local max_new_tokens="$1"
+    local out_dir="$2"
+    local log_path="$3"
+
+    mkdir -p "$(dirname "${log_path}")"
+
+    # 进场前：确保上一 stage 的进程组已经退出
+    _kill_current_stage
+    _wait_port_free 60 || return 1
+
+    # setsid：让 swift eval 在全新 session 里运行，自动成为新进程组的 leader（PGID = PID）。
+    # 子孙进程（含 vLLM EngineCore）继承该 PGID；即使被 PID 1 收养，PGID 也不变。
+    # 后续只需 kill -TERM/-KILL -$PGID 即可整组清理，无需任何 /proc 扫描。
+    setsid env \
+        CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+        PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
+    swift eval \
+        --model "${MODEL_PATH}" \
+        --port "${PORT}" \
+        --model_type qwen3 \
+        --template qwen3 \
+        --enable_thinking true \
+        --external_plugins "${ADAPTER_PLUGIN}" \
+        --eval_backend Native \
+        --eval_dataset gpqa_diamond \
+        --eval_dataset_args "{
+            \"gpqa_diamond\": {
+                \"local_path\": \"${DATASET_PATH}\",
+                \"subset_list\": [\"default\"],
+                \"few_shot_num\": 0,
+                \"aggregation\": \"mean_and_pass_at_k\"
+            }
+        }" \
+        --extra_eval_args "{\"repeats\": ${PASS_K}, \"seed\": ${EVAL_SEED}, \"judge_strategy\": \"rule\", \"model_args\": {\"max_retries\": 0}}" \
+        --eval_generation_config "{\"temperature\": ${TEMPERATURE}, \"top_p\": ${TOP_P}, \"extra_body\": {\"top_k\": ${TOP_K}}, \"max_tokens\": ${max_new_tokens}, \"timeout\": ${EVAL_REQUEST_TIMEOUT}, \"retries\": ${EVAL_REQUEST_ATTEMPTS}, \"retry_interval\": 10, \"stream\": false}" \
+        --infer_backend vllm \
+        --vllm_gpu_memory_utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
+        --vllm_tensor_parallel_size "${VLLM_TP_SIZE}" \
+        --vllm_data_parallel_size "${VLLM_DP_SIZE}" \
+        --eval_num_proc "${EVAL_NUM_PROC}" \
+        --max_new_tokens "${max_new_tokens}" \
+        --temperature "${TEMPERATURE}" \
+        --top_p "${TOP_P}" \
+        --top_k "${TOP_K}" \
+        --attn_impl flash_attn \
+        --torch_dtype bfloat16 \
+        --stream false \
+        --eval_output_dir "${out_dir}" \
+        >"${log_path}" 2>&1 &
+    local swift_pid=$!
+    CURRENT_SWIFT_PGID=${swift_pid}   # setsid 后 PID = PGID，整组用这个 id 清理
+    echo "[info]  swift eval pid/pgid=${swift_pid}  max_new_tokens=${max_new_tokens}  (tail -f ${log_path})"
+
+    local DONE_MARK='End time of running main'
+    # vLLM / EngineCore 启动失败时通常会很快写出明确错误；提前识别可避免卡在 STALL_TIMEOUT 才被判 hang。
+    local FAIL_MARK_1='Free memory on device cuda:'
+    local FAIL_MARK_2='EngineCore failed to start.'
+    local FAIL_MARK_3='Engine core initialization failed.'
+    local GRACE_SEC=30
+    local HARD_TIMEOUT=${EVAL_HARD_TIMEOUT}   # 整档运行上限，默认 12 小时
+    local STALL_TIMEOUT=${EVAL_STALL_TIMEOUT}  # 允许长生成，至少覆盖请求等待时间
+    local start_ts
+    start_ts=$(date +%s)
+    local hang=0
+    local completed=0
+
+    while kill -0 "${swift_pid}" 2>/dev/null; do
+        # 1) 正常完成：只扫日志尾部，避免巨大文件每 5s 全量 grep
+        if [ -f "${log_path}" ] && tail -c 65536 "${log_path}" 2>/dev/null | grep -qF "${DONE_MARK}"; then
+            completed=1
+            echo "[info]  stage done in log, wait ${GRACE_SEC}s for clean exit..."
+            for _ in $(seq 1 ${GRACE_SEC}); do
+                kill -0 "${swift_pid}" 2>/dev/null || break
+                sleep 1
+            done
+            break
+        fi
+
+        # 1.5) 明确失败：vLLM 显存不足 / EngineCore 起不来时，直接结束本 stage（避免等到 stall 才 kill）
+        if [ -f "${log_path}" ] && tail -c 65536 "${log_path}" 2>/dev/null | grep -qF "${FAIL_MARK_1}"; then
+            echo "[warn]  detected vLLM insufficient free memory; aborting this stage early"
+            hang=1
+            break
+        fi
+        if [ -f "${log_path}" ] && tail -c 65536 "${log_path}" 2>/dev/null | grep -qF "${FAIL_MARK_2}"; then
+            echo "[warn]  detected vLLM EngineCore startup failure; aborting this stage early"
+            hang=1
+            break
+        fi
+        if [ -f "${log_path}" ] && tail -c 65536 "${log_path}" 2>/dev/null | grep -qF "${FAIL_MARK_3}"; then
+            echo "[warn]  detected vLLM engine initialization failure; aborting this stage early"
+            hang=1
+            break
+        fi
+
+        local now_ts
+        now_ts=$(date +%s)
+
+        # 2) 日志 stall：mtime 超过 STALL_TIMEOUT 没变就当卡死
+        if [ -f "${log_path}" ]; then
+            local log_mtime idle
+            log_mtime=$(stat -c %Y "${log_path}" 2>/dev/null || echo "${now_ts}")
+            idle=$(( now_ts - log_mtime ))
+            if [ "${idle}" -gt "${STALL_TIMEOUT}" ]; then
+                echo "[warn]  log stall ${idle}s (>${STALL_TIMEOUT}s), treating as hang"
+                hang=1
+                break
+            fi
+        fi
+
+        # 3) 硬超时兜底
+        if [ $((now_ts - start_ts)) -gt ${HARD_TIMEOUT} ]; then
+            echo "[warn]  hard timeout ${HARD_TIMEOUT}s reached"
+            hang=1
+            break
+        fi
+        sleep 5
+    done
+
+    # 收尾：杀掉整个进程组（含孤儿 EngineCore），然后等端口释放
+    _kill_current_stage
+    local swift_status=0
+    wait "${swift_pid}" || swift_status=$?
+    _wait_port_free 120 || return 1
+    echo "[info]  stage max_new_tokens=${max_new_tokens} exited (status=${swift_status})"
+    if [ "${hang}" -ne 0 ] || { [ "${completed}" -eq 0 ] && [ "${swift_status}" -ne 0 ]; }; then
+        echo "[error] GPQA-Diamond stage failed; check ${log_path}" >&2
+        return 1
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 聚合：从单档的 reports/<model_name>/<dataset>.json 提 metric 写 stats.tsv
+# ------------------------------------------------------------------
+extract_metrics() {
+    local max_new_tokens="$1"
+    local out_dir="$2"
+    python3 - "${MODEL_PATH}" "${max_new_tokens}" "${out_dir}" "${PASS_K}" "${STATS_TSV}" "${EXPECTED_QUESTIONS}" <<'PY'
+import glob, json, math, os, sys
+from collections import defaultdict
+from pathlib import Path
+from evalscope.report.report import normalize_score
+
+model_path, max_new_tokens, out_dir, pass_k, stats_tsv, expected_questions = sys.argv[1:]
+repeats, expected_questions = int(pass_k), int(expected_questions)
+report_files = sorted(glob.glob(
+    os.path.join(out_dir, 'native', '*', 'reports', '*', '*.json')
+))
+reports = []
+for rp in report_files:
+    with open(rp, encoding='utf-8') as f:
+        report = json.load(f)
+    dataset = report.get('dataset_name') or os.path.splitext(os.path.basename(rp))[0]
+    if dataset == 'gpqa_diamond':
+        reports.append(report)
+if len(reports) != 1:
+    raise SystemExit(f'[error] 应有一份 GPQA-Diamond 报告，实际找到 {len(reports)} 份: {out_dir}')
+metrics = {m['name']: float(m['score']) for m in reports[0].get('metrics', [])}
+required_metrics = ('mean_acc', f'mean_acc_pass@{pass_k}')
+if any(name not in metrics for name in required_metrics):
+    raise SystemExit(f'[error] 报告缺少指标 {required_metrics}; available={list(metrics)}')
+
+def load_records(kind):
+    records = {}
+    paths = glob.glob(os.path.join(out_dir, 'native', '*', kind, '*', 'gpqa_diamond_*.jsonl'))
+    for path in paths:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                index = record['index']
+                if index in records:
+                    raise SystemExit(f'[error] {kind} 出现重复作答编号: {index}')
+                records[index] = record
+    return records
+
+reviews, predictions = load_records('reviews'), load_records('predictions')
+expected_samples = expected_questions * repeats
+if len(reviews) != expected_samples or set(reviews) != set(predictions):
+    raise SystemExit(f'[error] 作答记录不完整: expected={expected_samples}, reviews={len(reviews)}, predictions={len(predictions)}')
+groups = defaultdict(list)
+invalid, truncated, token_counts = 0, 0, []
+for index, review in reviews.items():
+    sample = review['sample_score']
+    score = sample['score']
+    extracted = str(score.get('extracted_prediction') or '').strip().upper()
+    target = str(review['target']).strip().upper()
+    if target not in 'ABCD' or len(target) != 1:
+        raise SystemExit(f'[error] 标准选项异常: index={index}')
+    correct = float(extracted == target)
+    if not math.isclose(float(score['value']['acc']), correct, abs_tol=1e-9):
+        raise SystemExit(f'[error] 单题评分与选项匹配不一致: index={index}')
+    groups[sample['group_id']].append(correct)
+    invalid += extracted not in {'A', 'B', 'C', 'D'}
+    output = predictions[index]['model_output']
+    if output.get('error') or len(output.get('choices', [])) != 1:
+        raise SystemExit(f'[error] 模型响应异常: index={index}')
+    truncated += output['choices'][0].get('stop_reason') == 'max_tokens'
+    token_counts.append(float(output['usage']['output_tokens']))
+if len(groups) != expected_questions or any(len(scores) != repeats for scores in groups.values()):
+    raise SystemExit('[error] 题目分组或每题重复次数不正确')
+mean_acc = sum(sum(scores) for scores in groups.values()) / expected_samples
+pass_at_k = sum(any(scores) for scores in groups.values()) / expected_questions
+for name, value in zip(required_metrics, (mean_acc, pass_at_k)):
+    # EvalScope serializes report scores through normalize_score (4 decimal places).
+    expected_report_score = normalize_score(float(value))
+    if metrics[name] != expected_report_score:
+        raise SystemExit(f'[error] 指标复算不一致: {name}, report={metrics[name]}, recomputed={value}')
+diagnostics = {
+    'questions': len(groups), 'repeats': repeats, 'samples': len(reviews),
+    'mean_acc': mean_acc, f'mean_acc_pass@{pass_k}': pass_at_k,
+    'invalid_answer_rate': invalid / expected_samples,
+    'max_tokens_rate': truncated / expected_samples,
+    'mean_output_tokens': sum(token_counts) / expected_samples,
+    'scores_independently_verified': True,
+    'reported_metrics': {name: metrics[name] for name in required_metrics},
+    'report_comparison': 'exact match after EvalScope normalize_score',
+}
+Path(out_dir, 'gpqa_diamond_diagnostics.json').write_text(
+    json.dumps(diagnostics, indent=2) + '\n', encoding='utf-8')
+rows = [(name, diagnostics[name]) for name in (*required_metrics, 'invalid_answer_rate', 'max_tokens_rate', 'mean_output_tokens')]
+with open(stats_tsv, 'a', encoding='utf-8') as out:
+    for name, value in rows:
+        out.write(f'{model_path}\t{max_new_tokens}\tgpqa_diamond\t{name}\t{value:.4f}\n')
+        print(f'  [{max_new_tokens}] gpqa_diamond {name} = {value:.4f}')
+if invalid or truncated:
+    print(f'[warn] {invalid}/{expected_samples} 次未提取到有效 A-D 选项，{truncated}/{expected_samples} 次达到生成上限；这些作答仍纳入官方正确率。')
+PY
+}
+
+# ------------------------------------------------------------------
+# 主循环
+# ------------------------------------------------------------------
+FAILED=()
+for L in "${MAX_NEW_TOKENS_SWEEP[@]}"; do
+    echo ""
+    echo "=========================================="
+    echo "Sweep step: max_new_tokens=${L}"
+    echo "=========================================="
+
+    OUT_DIR="${EVAL_ROOT_DIR}/max_new_tokens_${L}"
+    LOG_PATH="${EVAL_ROOT_DIR}/logs/stage_${L}.log"
+    if ! run_one_eval "${L}" "${OUT_DIR}" "${LOG_PATH}"; then
+        FAILED+=("${L}")
+        continue
+    fi
+
+    # 保留 predictions 和 reviews，便于检查最终选项及评分结果。
+    # 提本档指标到 stats.tsv
+    if ! extract_metrics "${L}" "${OUT_DIR}"; then
+        echo "[warn]  extract_metrics failed for ${L}"
+        FAILED+=("${L}")
+    fi
+done
+
+echo ""
+echo "=========================================="
+if [ ${#FAILED[@]} -gt 0 ]; then
+    echo "Done with failures at: ${FAILED[*]}"
+else
+    echo "Done."
+fi
+echo "Stats: ${STATS_TSV}"
+cat "${STATS_TSV}"
+echo "=========================================="
+if [ ${#FAILED[@]} -gt 0 ]; then
+    exit 1
+fi

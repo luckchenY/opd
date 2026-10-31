@@ -1,0 +1,8 @@
+{
+  "reason": "User moved launcher folder to opdswift root. Derive project root from script location, centralize dataset paths and use one configuration for CPU preflight and actual Swift invocation; update README. Numerical evaluation protocol unchanged.",
+  "before_sha256": {
+    "eval_llama200.sh": "90da2a29f08efb031b1cdd8b02445b7f51d19ae9805180bb57bfa2eefda235c0",
+    "support.py": "544f4142caab0a00585a2a55c1e8d4e9eefed2468a04c1180ea654f8e66acc64",
+    "README.md": "17acc98531e5e950aeb28a6b7f6dc2c685ec50569d0b6cb7739d98c6977c6e31"
+  }
+}

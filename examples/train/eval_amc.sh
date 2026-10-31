@@ -1,125 +1,120 @@
 #!/bin/bash
 set -uo pipefail
 
-# ========================================
-# AMC 评测：每档 max_new_tokens 独立跑一次 swift eval
-# 数据:    data/eval_datasets/amc/{amc22,amc23,amc24}.jsonl
-# adapter: evalscope 的 amc (split_as_subset=True，subset_list=['amc22','amc23','amc24'])
-# ========================================
-MODEL_PATH=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/output_gkd_on_policy/v0-20260510-012050/v0-20260510-012109/checkpoint-2350
-GPU_ID=1
-# ========================================
+MODEL_PATH=/data/chenyang/models/eopd
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-5,6,7}
 
-PASS_K=8
+PASS_K=4
 TEMPERATURE=1
-TOP_P=0.8
-MAX_NEW_TOKENS_SWEEP=(4096 8192 16384 32768)
+TOP_P=0.95
+TOP_K=50
+MAX_NEW_TOKENS_SWEEP=(8192)
 
-DATA_DIR=/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/yangchen/ms-swift/data/eval_datasets/amc
+DATA_DIR=/data/chenyang/opdswift/data/eval_datasets/amc_official
+
+# ------------------------------------------------------------------
+# 自动检测 GPU 列表
+# ------------------------------------------------------------------
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    GPU_LIST="${CUDA_VISIBLE_DEVICES}"
+else
+    GPU_LIST=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
+fi
+if [ -z "${GPU_LIST}" ]; then
+    echo "[error] 没有发现可用的 GPU"; exit 1
+fi
+GPU_IDS_ARRAY=( $(echo "${GPU_LIST}" | tr ',' ' ') )
+NUM_GPUS=${#GPU_IDS_ARRAY[@]}
+GPU_LIST=$(IFS=,; echo "${GPU_IDS_ARRAY[*]}")
+
+# 数据并行 = 卡数；张量并行固定 1（1.5B 模型够小，DP 吞吐最高）
+VLLM_DP_SIZE=${NUM_GPUS}
+VLLM_TP_SIZE=1
+EVAL_NUM_PROC=$((16 * NUM_GPUS))
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EVAL_ROOT_DIR="${MODEL_PATH}/eval_results/amc_${TIMESTAMP}"
+MODEL_NAME_SAFE=$(basename "${MODEL_PATH}" | tr '/' '__')
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL_ROOT_DIR="${SCRIPT_DIR}/test_result/${MODEL_NAME_SAFE}/amc_${TIMESTAMP}"
 STATS_TSV="${EVAL_ROOT_DIR}/stats.tsv"
 
-# 唯一的 run id：只用来识别"哪些进程是本次 bash 启动的"。
-# 即使同一张 GPU 上同时跑其他人的 swift/vLLM，也不会被误杀。
-EVAL_AMC_RUN_ID="eval_amc_$$_$(date +%s)_${GPU_ID}"
-export EVAL_AMC_RUN_ID
+CURRENT_SWIFT_PGID=""
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 
 for sub in amc22 amc23 amc24; do
-    if [ ! -s "${DATA_DIR}/${sub}.jsonl" ]; then
-        echo "[WARN] ${DATA_DIR}/${sub}.jsonl 不存在或为空，请先跑 tools/download_amc.py" >&2
+    if [ ! -s "${DATA_DIR}/data/${sub}-00000-of-00001.parquet" ] && [ ! -s "${DATA_DIR}/${sub}.jsonl" ]; then
+        echo "[WARN] AMC subset ${sub} 缺失，请先跑: python tools/download_amc.py" >&2
     fi
 done
 
 mkdir -p "${EVAL_ROOT_DIR}"
 {
   echo -e "# model_path\t${MODEL_PATH}"
-  echo -e "# gpu\t${GPU_ID}"
+  echo -e "# gpus\t${GPU_LIST}\tnum_gpus\t${NUM_GPUS}"
+  echo -e "# vllm_parallel\tDP=${VLLM_DP_SIZE}\tTP=${VLLM_TP_SIZE}"
   echo -e "# repeats\t${PASS_K}\ttemperature\t${TEMPERATURE}\ttop_p\t${TOP_P}"
   echo -e "# bench\tamc"
   echo -e "# strategy\tsweep_max_new_tokens"
   echo -e "model_path\tmax_new_tokens\tdataset\tmetric\tvalue"
 } > "${STATS_TSV}"
 
-PORT=$((8000 + GPU_ID))
+# 端口随首张卡 id 偏移，避免不同 run 端口冲突
+PORT=$((8000 + GPU_IDS_ARRAY[0]))
 
 echo "=========================================="
 echo "Model:      ${MODEL_PATH}"
 echo "Dataset:    AMC  (${DATA_DIR})"
-echo "GPU:        ${GPU_ID}        Port: ${PORT}"
+echo "GPUs:       ${GPU_LIST}        (DP=${VLLM_DP_SIZE}, TP=${VLLM_TP_SIZE})"
+echo "Port:       ${PORT}"
+echo "Eval proc:  ${EVAL_NUM_PROC}"
 echo "Sweep:      ${MAX_NEW_TOKENS_SWEEP[*]}"
 echo "Stats:      ${STATS_TSV}"
-echo "Run ID:     ${EVAL_AMC_RUN_ID}"
 echo "=========================================="
 
-# 兜底：脚本被 Ctrl+C / kill 时，清掉本次 run 的所有残留
-trap 'echo "[info]  trap: cleaning up run ${EVAL_AMC_RUN_ID}"; _kill_run_residuals 2>/dev/null || true' EXIT INT TERM
-
-# ------------------------------------------------------------------
-# env 匹配兜底：只杀"本次 bash 脚本启动的 swift eval / vLLM 子孙"。
-# 主清理走 setsid 进程组（见 run_one_eval），env 匹配只是兜底。
-# ------------------------------------------------------------------
-_pid_belongs_to_run() {
-    local pid="$1"
-    local env_file="/proc/${pid}/environ"
-    [ -r "${env_file}" ] || return 1
-    grep -qzxF "EVAL_AMC_RUN_ID=${EVAL_AMC_RUN_ID}" "${env_file}" 2>/dev/null || return 1
-    return 0
-}
-
-_list_run_pids() {
-    local pid
-    for pid in /proc/[0-9]*; do
-        pid=${pid##*/}
-        [ "${pid}" = "$$" ] && continue
-        _pid_belongs_to_run "${pid}" && echo "${pid}"
-    done
-}
-
-_kill_run_residuals() {
-    local pids
-    pids=$(_list_run_pids)
-    [ -z "${pids}" ] && return 0
-    echo "[info]  killing run residuals on GPU ${GPU_ID}: ${pids//$'\n'/ }"
-    # shellcheck disable=SC2086
-    kill -TERM ${pids} 2>/dev/null || true
+_kill_current_stage() {
+    [ -z "${CURRENT_SWIFT_PGID}" ] && return 0
+    local pgid="${CURRENT_SWIFT_PGID}"
+    echo "[info]  sending SIGTERM to process group ${pgid}"
+    kill -TERM -"${pgid}" 2>/dev/null || true
     local i
-    for i in $(seq 1 5); do
-        pids=$(_list_run_pids)
-        [ -z "${pids}" ] && return 0
+    for i in $(seq 1 8); do
+        kill -0 -"${pgid}" 2>/dev/null || { CURRENT_SWIFT_PGID=""; return 0; }
         sleep 1
     done
-    pids=$(_list_run_pids)
-    if [ -n "${pids}" ]; then
-        echo "[warn]  SIGKILL residuals: ${pids//$'\n'/ }"
-        # shellcheck disable=SC2086
-        kill -KILL ${pids} 2>/dev/null || true
-    fi
-    sleep 3
+    echo "[warn]  SIGKILL process group ${pgid}"
+    kill -KILL -"${pgid}" 2>/dev/null || true
+    sleep 2
+    CURRENT_SWIFT_PGID=""
 }
 
-_wait_gpu_clean() {
+_wait_port_free() {
     local wait_sec="${1:-60}"
-    local i mem
+    local i
     for i in $(seq 1 "${wait_sec}"); do
-        mem=$(nvidia-smi --id="${GPU_ID}" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
-        if [ "${mem:-0}" -lt 500 ] && ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}$"; then
-            return 0
-        fi
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${PORT}$" || return 0
         sleep 1
     done
-    echo "[warn]  GPU ${GPU_ID} still busy after ${wait_sec}s (mem=${mem}MiB); proceeding anyway"
+    echo "[warn]  port ${PORT} still busy after ${wait_sec}s"
 }
+
+_on_exit() {
+    echo "[info]  cleanup on exit"
+    _kill_current_stage 2>/dev/null || true
+}
+_on_signal() {
+    local sig="$1"
+    echo "[info]  got ${sig}, aborting"
+    _kill_current_stage 2>/dev/null || true
+    trap - EXIT INT TERM
+    exit 130
+}
+trap '_on_exit' EXIT
+trap '_on_signal INT'  INT
+trap '_on_signal TERM' TERM
 
 # ------------------------------------------------------------------
-# 跑一档 swift eval：
-#   - setsid 独立 process group → 收尾按 pgid 一锅端，
-#     能可靠打到 vLLM v1 EngineCore（它会 rewrite CUDA_VISIBLE_DEVICES，
-#     基于 env 的匹配漏不了它，但不可靠）。
-#   - 扫 log 的致命错误标志，命中立刻退出，不再等 HARD_TIMEOUT。
+# 跑一档 swift eval（setsid 进程组清理，与 eval_aime.sh 一致）
 # ------------------------------------------------------------------
 run_one_eval() {
     local max_new_tokens="$1"
@@ -128,89 +123,106 @@ run_one_eval() {
 
     mkdir -p "$(dirname "${log_path}")"
 
-    _kill_run_residuals
-    _wait_gpu_clean 60
+    _kill_current_stage
+    _wait_port_free 60
 
-    CUDA_VISIBLE_DEVICES="${GPU_ID}" \
-    PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
-    setsid swift eval \
+    setsid env \
+        CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
+        PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
+    swift eval \
         --model "${MODEL_PATH}" \
         --port "${PORT}" \
         --eval_backend Native \
         --eval_dataset amc \
         --eval_dataset_args "{
-            \"amc\": {\"local_path\": \"${DATA_DIR}\", \"aggregation\": \"mean_and_pass_at_k\"}
+            \"amc\": {
+                \"local_path\": \"${DATA_DIR}\",
+                \"aggregation\": \"mean_and_pass_at_k\",
+                \"subset_list\": [\"amc23\", \"amc24\"]
+            }
         }" \
         --extra_eval_args "{\"repeats\": ${PASS_K}}" \
         --infer_backend vllm \
         --vllm_gpu_memory_utilization 0.9 \
+        --model_type qwen2 \
+        --template deepseek_r1 \
+        --vllm_tensor_parallel_size "${VLLM_TP_SIZE}" \
+        --vllm_data_parallel_size "${VLLM_DP_SIZE}" \
+        --eval_num_proc "${EVAL_NUM_PROC}" \
         --max_new_tokens "${max_new_tokens}" \
         --temperature "${TEMPERATURE}" \
         --top_p "${TOP_P}" \
+        --top_k "${TOP_K}" \
         --attn_impl flash_attn \
         --torch_dtype bfloat16 \
         --stream false \
         --eval_output_dir "${out_dir}" \
         >"${log_path}" 2>&1 &
     local swift_pid=$!
-    local swift_pgid="${swift_pid}"   # setsid 之后 pid == sid == pgid
-    echo "[info]  swift eval pid=${swift_pid} (pgid=${swift_pgid})  max_new_tokens=${max_new_tokens}  (tail -f ${log_path})"
+    CURRENT_SWIFT_PGID=${swift_pid}
+    echo "[info]  swift eval pid/pgid=${swift_pid}  max_new_tokens=${max_new_tokens}  (tail -f ${log_path})"
 
     local DONE_MARK='End time of running main'
-    local FATAL_RE='Engine core initialization failed|ValueError: Free memory on device|torch\.OutOfMemoryError|CUDA out of memory'
+    local FAIL_MARK_1='Free memory on device cuda:'
+    local FAIL_MARK_2='EngineCore failed to start.'
+    local FAIL_MARK_3='Engine core initialization failed.'
     local GRACE_SEC=30
-    local HARD_TIMEOUT=10800   # 单档最多 3 小时
-    local start_ts=$(date +%s)
-    local stage_status='timeout'
+    local HARD_TIMEOUT=10800
+    local STALL_TIMEOUT=300
+    local start_ts
+    start_ts=$(date +%s)
+    local hang=0
 
     while kill -0 "${swift_pid}" 2>/dev/null; do
+        if [ -f "${log_path}" ] && tail -c 65536 "${log_path}" 2>/dev/null | grep -qF "${DONE_MARK}"; then
+            echo "[info]  stage done in log, wait ${GRACE_SEC}s for clean exit..."
+            for _ in $(seq 1 ${GRACE_SEC}); do
+                kill -0 "${swift_pid}" 2>/dev/null || break
+                sleep 1
+            done
+            break
+        fi
+        if [ -f "${log_path}" ] && tail -c 65536 "${log_path}" 2>/dev/null | grep -qF "${FAIL_MARK_1}"; then
+            echo "[warn]  detected vLLM insufficient free memory; aborting this stage early"
+            hang=1
+            break
+        fi
+        if [ -f "${log_path}" ] && tail -c 65536 "${log_path}" 2>/dev/null | grep -qF "${FAIL_MARK_2}"; then
+            echo "[warn]  detected vLLM EngineCore startup failure; aborting this stage early"
+            hang=1
+            break
+        fi
+        if [ -f "${log_path}" ] && tail -c 65536 "${log_path}" 2>/dev/null | grep -qF "${FAIL_MARK_3}"; then
+            echo "[warn]  detected vLLM engine initialization failure; aborting this stage early"
+            hang=1
+            break
+        fi
+
+        local now_ts
+        now_ts=$(date +%s)
         if [ -f "${log_path}" ]; then
-            if grep -q "${DONE_MARK}" "${log_path}"; then
-                echo "[info]  stage done in log, wait ${GRACE_SEC}s for clean exit..."
-                for _ in $(seq 1 ${GRACE_SEC}); do
-                    kill -0 "${swift_pid}" 2>/dev/null || break
-                    sleep 1
-                done
-                stage_status='done'
-                break
-            fi
-            if grep -qE "${FATAL_RE}" "${log_path}"; then
-                echo "[warn]  fatal error detected in ${log_path##*/} — aborting stage ${max_new_tokens}"
-                stage_status='crashed'
+            local log_mtime idle
+            log_mtime=$(stat -c %Y "${log_path}" 2>/dev/null || echo "${now_ts}")
+            idle=$(( now_ts - log_mtime ))
+            if [ "${idle}" -gt "${STALL_TIMEOUT}" ]; then
+                echo "[warn]  log stall ${idle}s (>${STALL_TIMEOUT}s), treating as hang"
+                hang=1
                 break
             fi
         fi
-        local now_ts=$(date +%s)
         if [ $((now_ts - start_ts)) -gt ${HARD_TIMEOUT} ]; then
             echo "[warn]  hard timeout ${HARD_TIMEOUT}s reached"
+            hang=1
             break
         fi
         sleep 5
     done
 
-    # 收尾：按进程组一锅端
-    if kill -0 -- "-${swift_pgid}" 2>/dev/null; then
-        echo "[info]  SIGTERM process group ${swift_pgid}"
-        kill -TERM -- "-${swift_pgid}" 2>/dev/null || true
-        local i
-        for i in $(seq 1 5); do
-            kill -0 -- "-${swift_pgid}" 2>/dev/null || break
-            sleep 1
-        done
-        if kill -0 -- "-${swift_pgid}" 2>/dev/null; then
-            echo "[warn]  SIGKILL process group ${swift_pgid}"
-            kill -KILL -- "-${swift_pgid}" 2>/dev/null || true
-        fi
-    fi
-    _kill_run_residuals
-    wait "${swift_pid}" 2>/dev/null || true
-    _wait_gpu_clean 30
-    echo "[info]  stage max_new_tokens=${max_new_tokens} exited (status=${stage_status})"
+    _kill_current_stage
+    _wait_port_free 120
+    echo "[info]  stage max_new_tokens=${max_new_tokens} exited (hang=${hang})"
 }
 
-# ------------------------------------------------------------------
-# 聚合：从 reports/<model_name>/<dataset>.json 提 metric 写 stats.tsv
-# ------------------------------------------------------------------
 extract_metrics() {
     local max_new_tokens="$1"
     local out_dir="$2"
@@ -225,25 +237,35 @@ if not report_files:
     print(f'[warn]  no report found under {out_dir}')
     sys.exit(0)
 
+wanted = ['mean_acc', f'mean_acc_pass@{pass_k}']
+
+def write_row(out, ds, name, value):
+    out.write(f'{model_path}\t{max_new_tokens}\t{ds}\t{name}\t{value:.4f}\n')
+    print(f'  [{max_new_tokens}] {ds} {name} = {value:.4f}')
+
 with open(stats_tsv, 'a', encoding='utf-8') as out:
     for rp in report_files:
         with open(rp) as f:
             d = json.load(f)
         ds = d.get('dataset_name') or os.path.splitext(os.path.basename(rp))[0]
-        metrics = {m['name']: m['score'] for m in d.get('metrics', [])}
-        wanted = ['mean_acc', f'mean_acc_pass@{pass_k}']
+        metrics_by_name = {m['name']: m for m in d.get('metrics', [])}
         for name in wanted:
-            v = metrics.get(name)
-            if v is None:
+            m = metrics_by_name.get(name)
+            if m is None:
                 continue
-            out.write(f'{model_path}\t{max_new_tokens}\t{ds}\t{name}\t{v:.4f}\n')
-            print(f'  [{max_new_tokens}] {ds} {name} = {v:.4f}')
+            # overall (all subsets pooled)
+            write_row(out, ds, name, float(m['score']))
+            # per-subset (amc23 / amc24 / ...)
+            for cat in m.get('categories') or []:
+                for sub in cat.get('subsets') or []:
+                    sub_name = sub.get('name')
+                    sub_score = sub.get('score')
+                    if sub_name is None or sub_score is None:
+                        continue
+                    write_row(out, f'{ds}/{sub_name}', name, float(sub_score))
 PY
 }
 
-# ------------------------------------------------------------------
-# 主循环
-# ------------------------------------------------------------------
 FAILED=()
 for L in "${MAX_NEW_TOKENS_SWEEP[@]}"; do
     echo ""

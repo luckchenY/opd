@@ -1,0 +1,8 @@
+{
+  "reason": "User requires stats.tsv. Restore the five-column run-root summary, initialize header at run start and write verified per-stage/subset metrics after successful CPU verification. Idempotent atomic updates preserve earlier stage rows. Keep test_results default and all scoring/generation settings unchanged.",
+  "before_sha256": {
+    "eval_llama200.sh": "815ccea8e782e0a71de096830cc92158319c94d520e9fd55b7727584dbbdf272",
+    "verify_results.py": "a68b0de75e0defa1f546edf50236d160da40c8c7c1ba0045ca2cd6b598a23075",
+    "README.md": "d42e4573791b030255435160ccda6da68789c5a3c437338542fd1e7834b812da"
+  }
+}

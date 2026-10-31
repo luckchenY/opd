@@ -1,0 +1,7 @@
+{
+  "reason": "Live tests exposed Swift auxiliary eval_result.jsonl following caller CWD. Run Swift within each absolute stage output directory and save that cwd in command.sh. Preserve user default test_results and all numerical evaluation settings.",
+  "before_sha256": {
+    "eval_llama200.sh": "380baa55381260f0c15a76e45498ca1c0890520ece1ab4f7d17c3cc756e15a43",
+    "README.md": "9c46b038cdc75b93b2927d570a18e1a1360ccb9e1d74bcadd44d46904510be45"
+  }
+}

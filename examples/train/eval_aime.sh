@@ -6,24 +6,17 @@ set -uo pipefail
 # ========================================
 # 本地 checkpoint 路径，或 HuggingFace/ModelScope 模型名（base 模型直接填名字）
 # MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
-MODEL_PATH=/home/ubuntu/chenyang/opd/tools/consistency_opd_output/checkpoints/epoch_002
-
-# GPU 选择：
-#   1) 如果调用方设置了 CUDA_VISIBLE_DEVICES，就用它指定的卡（脚本不会改写它）
-#   2) 否则用本机 nvidia-smi 看到的全部卡
-# 多卡时采用 vLLM 数据并行（DP）：每卡一份完整模型副本，请求做负载均衡
-# 单机评测里这是最快的并行方式（无 TP 通信开销，吞吐随卡数近线性增长）。
-# ========================================
-
-PASS_K=1
+MODEL_PATH=/data/chenyang/OPD/checkpoint/Justrl-consistency/global_step_200/merged_hf
+export CUDA_VISIBLE_DEVICES=1,4,5,7
+PASS_K=32
 TEMPERATURE=1
 TOP_P=0.95
 TOP_K=50
 
 # 每档分别做一次独立的 swift eval，跑完立即拿到该长度的官方指标（不做截断）
-MAX_NEW_TOKENS_SWEEP=(16384)
+MAX_NEW_TOKENS_SWEEP=(8192)
 
-DATA_DIR=/home/ubuntu/chenyang/opd/data/aime_datasets
+DATA_DIR=/data/chenyang/opdswift/data/data/aime_datasets
 # ------------------------------------------------------------------
 # 自动检测 GPU 列表
 # ------------------------------------------------------------------
@@ -80,12 +73,6 @@ echo "Eval proc:  ${EVAL_NUM_PROC}"
 echo "Sweep:      ${MAX_NEW_TOKENS_SWEEP[*]}"
 echo "Stats:      ${STATS_TSV}"
 echo "=========================================="
-
-# ------------------------------------------------------------------
-# 进程组清理：用 setsid 让 swift eval 自成一个新 session（PGID = swift_pid）。
-# 子孙进程（包括 vLLM EngineCore）继承 PGID；即使被 PID 1 收养，PGID 也不变。
-# kill -TERM/-KILL -$PGID 直接由内核投递给整组，无需任何 /proc 扫描。
-# ------------------------------------------------------------------
 
 # 杀掉当前 stage 的整个进程组，并等待其退出
 _kill_current_stage() {
@@ -155,8 +142,9 @@ run_one_eval() {
     swift eval \
         --model "${MODEL_PATH}" \
         --port "${PORT}" \
-        --model_type qwen3 \
-        --template qwen3 \
+        --model_type qwen2 \
+        --template deepseek_r1 \
+        --enable_thinking true \
         --eval_backend Native \
         --eval_dataset aime24 aime25 \
         --eval_dataset_args "{
@@ -166,7 +154,7 @@ run_one_eval() {
         }" \
         --extra_eval_args "{\"repeats\": ${PASS_K}}" \
         --infer_backend vllm \
-        --vllm_gpu_memory_utilization 0.9 \
+        --vllm_gpu_memory_utilization 0.7 \
         --vllm_tensor_parallel_size "${VLLM_TP_SIZE}" \
         --vllm_data_parallel_size "${VLLM_DP_SIZE}" \
         --eval_num_proc "${EVAL_NUM_PROC}" \
@@ -174,7 +162,6 @@ run_one_eval() {
         --temperature "${TEMPERATURE}" \
         --top_p "${TOP_P}" \
         --top_k "${TOP_K}" \
-        --enable_thinking false \
         --attn_impl flash_attn \
         --torch_dtype bfloat16 \
         --stream false \

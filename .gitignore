@@ -176,3 +176,4 @@ tools/analyze_pr_kl_merged_ckpts/
 # ast template
 ast_index_file.py
 tools/consistency_opd_output_test/
+examples/train/test_result
